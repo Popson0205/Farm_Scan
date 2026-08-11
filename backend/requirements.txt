@@ -1,0 +1,26 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+rasterio>=1.3
+numpy>=1.26
+shapely>=2.0
+geopandas>=0.14
+pystac-client>=0.8
+planetary-computer>=1.0
+pillow>=10.0
+python-multipart>=0.0.9
+opencv-python-headless>=4.9
+scikit-learn>=1.4
+scikit-image>=0.22
+scipy>=1.12
+openpyxl>=3.1
+fiona>=1.9
+reportlab>=4.1
+
+# Optional: only needed for the "AI segmentation" (SAM) plot-extraction method.
+# The app works fully without these -- /api/plots/extraction-methods reports
+# "sam" as unavailable and the frontend greys out that option. See
+# backend/vendor/mobile_sam/ and backend/models/mobile_sam.pt (already
+# vendored in this repo -- no separate download needed) plus README.md's
+# "AI-based plot extraction (MobileSAM)" section for details.
+torch>=2.0
+timm>=0.9

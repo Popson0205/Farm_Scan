@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+backend/farmscan.db
+.env
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# MobileSAM weights (~39MB) -- not committed, run
+# backend/scripts/download_sam_weights.py to fetch. Keeping this out of git
+# avoids GitHub's 25MB web-upload limit and keeps git history lean.
+backend/models/*.pt
+!backend/models/.gitkeep

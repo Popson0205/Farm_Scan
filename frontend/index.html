@@ -1,0 +1,1070 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FarmScan — Open Satellite Farm Monitoring</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css" />
+<style>
+  :root {
+    --green-900: #14361f;
+    --green-700: #1f5c33;
+    --green-600: #2c7a45;
+    --green-400: #6fbf8b;
+    --green-100: #eaf6ee;
+    --earth-100: #f7f4ee;
+    --ink: #1a1f1c;
+    --muted: #5c6b62;
+    --card-bg: #ffffff;
+    --border: #dde5df;
+    --danger: #b3462c;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+    color: var(--ink);
+    background: var(--earth-100);
+  }
+  #app { display: flex; flex-direction: column; height: 100vh; width: 100vw; }
+
+  #topbar {
+    padding: 10px 22px;
+    background: linear-gradient(135deg, var(--green-900), var(--green-700));
+    color: white;
+    display: flex; align-items: baseline; gap: 10px;
+    flex-shrink: 0;
+  }
+  #topbar h1 { font-size: 17px; margin: 0; font-weight: 700; letter-spacing: -0.01em; }
+  #topbar p { font-size: 12px; margin: 0; opacity: 0.85; }
+
+  #body { flex: 1; display: flex; min-height: 0; }
+
+  /* ---- Sidebars (left: vegetation health, right: plot extraction) ---- */
+  .sidebar {
+    width: 360px; min-width: 360px;
+    background: var(--card-bg);
+    display: flex; flex-direction: column;
+    overflow-y: auto;
+  }
+  #sidebar-left { border-right: 1px solid var(--border); }
+  #sidebar-right { border-left: 1px solid var(--border); }
+  .sidebar-title {
+    padding: 14px 22px 10px;
+    border-bottom: 1px solid var(--border);
+    background: var(--green-100);
+    color: var(--green-700);
+    font-size: 12.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .sidebar-title .sub { display: block; font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--muted); margin-top: 2px; font-size: 11.5px; }
+
+  .section { padding: 18px 22px; border-bottom: 1px solid var(--border); }
+  .section h2 {
+    font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); margin: 0 0 12px; font-weight: 700;
+  }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    width: 100%; padding: 10px 14px; border-radius: 8px; border: none;
+    font-size: 13.5px; font-weight: 600; cursor: pointer;
+    transition: background 0.15s ease, opacity 0.15s ease;
+  }
+  .btn-primary { background: var(--green-600); color: white; }
+  .btn-primary:hover { background: var(--green-700); }
+  .btn-secondary { background: var(--green-100); color: var(--green-700); border: 1px solid var(--green-400); }
+  .btn-secondary:hover { background: #dcf0e2; }
+  .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .btn-row { display: flex; gap: 8px; }
+
+  input[type="text"], input[type="date"], input[type="number"], select {
+    width: 100%; padding: 9px 10px; border: 1px solid var(--border); border-radius: 7px;
+    font-size: 13.5px; margin-bottom: 10px; background: #fff; color: var(--ink);
+  }
+  label { font-size: 12.5px; color: var(--muted); display: block; margin-bottom: 4px; font-weight: 600; }
+
+  #farm-list { display: flex; flex-direction: column; gap: 6px; max-height: 160px; overflow-y: auto; }
+  .farm-item {
+    padding: 8px 10px; border-radius: 7px; border: 1px solid var(--border);
+    font-size: 13px; cursor: pointer; display: flex; justify-content: space-between; align-items: center;
+  }
+  .farm-item:hover { background: var(--green-100); }
+  .farm-item.active { background: var(--green-100); border-color: var(--green-600); }
+  .farm-item .area { color: var(--muted); font-size: 11.5px; }
+
+  .index-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .index-btn {
+    padding: 10px 8px; border-radius: 8px; border: 1px solid var(--border);
+    background: #fff; font-size: 12.5px; font-weight: 600; text-align: left; cursor: pointer;
+  }
+  .index-btn:hover { border-color: var(--green-600); }
+  .index-btn.active { background: var(--green-600); color: #fff; border-color: var(--green-600); }
+  .index-btn .sub { display: block; font-weight: 400; font-size: 10.5px; opacity: 0.75; margin-top: 2px; }
+
+  #stats-box {
+    background: var(--green-100); border-radius: 8px; padding: 12px 14px; font-size: 13px;
+    display: none;
+  }
+  #stats-box.show { display: block; }
+  #stats-box .row { display: flex; justify-content: space-between; padding: 3px 0; }
+  #stats-box .row b { color: var(--green-700); }
+
+  #legend {
+    height: 14px; border-radius: 4px; margin: 8px 0 4px;
+    background: linear-gradient(to right, #d73027, #ffffbf, #1a9850);
+  }
+  #legend-labels { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--muted); }
+
+  .status-msg { font-size: 12px; padding: 8px 10px; border-radius: 7px; margin-top: 8px; display: none; }
+  .status-msg.show { display: block; }
+  .status-msg.info { background: #eef4fb; color: #2a4d78; }
+  .status-msg.error { background: #fbeceb; color: var(--danger); }
+  .status-msg.success { background: var(--green-100); color: var(--green-700); }
+
+  .hint { font-size: 11.5px; color: var(--muted); line-height: 1.5; margin-top: 6px; }
+
+  /* ---- Result tables (per-plot stats, plant counts, etc.) ---- */
+  .table-wrap { max-height: 260px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; margin-top: 8px; }
+  table.data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.data-table thead th {
+    position: sticky; top: 0; background: var(--green-700); color: #fff;
+    padding: 7px 8px; text-align: left; font-weight: 600; font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.03em;
+  }
+  table.data-table tbody td { padding: 6px 8px; border-top: 1px solid var(--border); color: var(--ink); }
+  table.data-table tbody tr:nth-child(even) { background: #fafcfa; }
+  table.data-table tbody tr:hover { background: var(--green-100); }
+  .table-caption { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
+
+  #map { flex: 1; }
+  .leaflet-container { background: #dfe9e2; }
+
+  .spinner {
+    width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.4);
+    border-top-color: #fff; border-radius: 50%; animation: spin 0.7s linear infinite;
+    display: inline-block;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="topbar">
+    <h1>🌾 FarmScan</h1>
+    <p>Vegetation health (left) · Plot extraction &amp; statistics (right)</p>
+  </div>
+
+  <div id="body">
+  <div id="sidebar-left" class="sidebar">
+    <div class="sidebar-title">Vegetation Health<span class="sub">Satellite / drone index analysis</span></div>
+
+    <div class="section">
+      <h2>1 · Farm Boundary</h2>
+      <div class="btn-row" style="margin-bottom:10px;">
+        <button class="btn btn-primary" id="btn-draw">✏️ Draw on map</button>
+        <button class="btn btn-secondary" id="btn-upload">📁 Upload GeoJSON</button>
+      </div>
+      <input type="file" id="file-input" accept=".json,.geojson" style="display:none;">
+      <div id="farm-list"></div>
+      <div class="status-msg" id="boundary-status"></div>
+    </div>
+
+    <div class="section">
+      <h2>2 · Imagery Date Range</h2>
+      <label>From</label>
+      <input type="date" id="date-start">
+      <label>To</label>
+      <input type="date" id="date-end">
+      <label>Max cloud cover (%)</label>
+      <input type="number" id="max-cloud" value="30" min="0" max="100">
+      <div class="btn-row">
+        <button class="btn btn-secondary" id="btn-search-live">🛰️ Search live scenes</button>
+      </div>
+      <div class="hint">Live search queries Sentinel-2 via Microsoft Planetary Computer (needs the backend to have outbound internet access). Use Demo Mode below if you're running this offline / in a sandboxed environment.</div>
+      <div class="status-msg" id="search-status"></div>
+      <div id="scene-list" style="margin-top:8px;"></div>
+    </div>
+
+    <div class="section">
+      <h2>3 · Vegetation / Water Index</h2>
+      <div class="index-grid" id="index-grid"></div>
+    </div>
+
+    <div class="section">
+      <div class="btn-row">
+        <button class="btn btn-primary" id="btn-process-demo">▶ Run (Demo data)</button>
+      </div>
+      <button class="btn btn-secondary" id="btn-process-live" style="margin-top:8px;" disabled>▶ Run on selected live scene</button>
+      <div class="status-msg" id="process-status"></div>
+    </div>
+
+    <div class="section" id="results-section" style="display:none;">
+      <h2>Results</h2>
+      <div id="legend"></div>
+      <div id="legend-labels"><span id="legend-min"></span><span id="legend-max"></span></div>
+      <div id="stats-box" class="show">
+        <div class="row"><span>Mean</span><b id="stat-mean">–</b></div>
+        <div class="row"><span>Min</span><b id="stat-min">–</b></div>
+        <div class="row"><span>Max</span><b id="stat-max">–</b></div>
+        <div class="row"><span>Std dev</span><b id="stat-std">–</b></div>
+        <div class="row"><span>Pixels sampled</span><b id="stat-px">–</b></div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Vegetation Exports</h2>
+      <div class="btn-row">
+        <button class="btn btn-secondary" id="exp-geotiff">GeoTIFF</button>
+        <button class="btn btn-secondary" id="exp-pdf">PDF report</button>
+      </div>
+      <div class="status-msg" id="export-status"></div>
+    </div>
+
+    <div class="section">
+      <h2>Annotations</h2>
+      <div class="hint" style="margin-bottom:8px;">Click the map after loading a farm to drop a note (e.g. "yellowing patch here").</div>
+      <button class="btn btn-secondary" id="btn-annotate-mode">📍 Click-to-annotate: off</button>
+      <div id="annotation-list" style="margin-top:10px; display:flex; flex-direction:column; gap:6px;"></div>
+    </div>
+  </div>
+
+  <div id="map"></div>
+
+  <div id="sidebar-right" class="sidebar">
+    <div class="sidebar-title">Plot Extraction &amp; Statistics<span class="sub">Drone-based plot detection, editing &amp; per-plot data</span></div>
+
+    <div class="section">
+      <h2>Drone Orthomosaic</h2>
+      <div class="hint" style="margin-bottom:8px;">Needs a cm-resolution drone orthomosaic (Pix4D/Agisoft/ODM output) — satellite imagery is too coarse to resolve individual plants or plots.</div>
+      <input type="file" id="drone-file-input" accept=".tif,.tiff" style="margin-bottom:8px;">
+      <button class="btn btn-secondary" id="btn-drone-upload">⬆ Upload orthomosaic</button>
+      <div class="status-msg" id="drone-status"></div>
+      <div id="drone-result" class="hint" style="margin-top:8px;"></div>
+      <div class="btn-row" style="margin-top:10px;">
+        <button class="btn btn-secondary" id="btn-toggle-drone-overlay" style="display:none;">🖼 Hide image on map</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Automatic Plot Extraction</h2>
+      <label>Detection method</label>
+      <select id="extract-method">
+        <option value="vegetation">Vegetation mask (fast, classical CV)</option>
+        <option value="sam">AI segmentation — MobileSAM (slower, better on road-delineated plots)</option>
+      </select>
+      <button class="btn btn-primary" id="btn-extract-plots" disabled>▦ Auto-extract plots from image</button>
+      <div class="hint" style="margin-top:6px;" id="extract-method-hint">Vegetation mask: detects each planted/green area as its own plot — best when plots are visually greener than their surroundings. AI segmentation: uses a pretrained model to find visually distinct regions in general, better when plots are separated by bare dirt tracks instead of by canopy color. Saves to the current boundary if one is loaded.</div>
+      <button class="btn btn-secondary" id="btn-plant-count" style="margin-top:10px;" disabled>🌱 Count plants (field-wide)</button>
+      <button class="btn btn-secondary" id="btn-plant-count-per-plot" style="margin-top:8px;" disabled>🌱 Count plants per plot</button>
+    </div>
+
+    <div class="section">
+      <h2>Image Acquisition Requirements</h2>
+      <div class="hint">For automatic plot extraction and plant counts to work, upload a <b>nadir (straight-down) orthomosaic GeoTIFF</b> stitched from a drone flight — not a single oblique photo. Typical settings: fly at a height giving 2–5cm/pixel ground resolution, 75%+ front overlap and 65%+ side overlap between photos, then stitch with Pix4D, DroneDeploy, Agisoft Metashape, or the free OpenDroneMap. Export the result as a GeoTIFF (.tif). A single non-georeferenced photo (e.g. a phone or gimbal shot) will not produce accurate plot boundaries or areas.</div>
+    </div>
+
+    <div class="section">
+      <h2>Manual Plot Tools</h2>
+      <div style="display:flex; gap:8px;">
+        <input type="number" id="grid-rows" placeholder="Rows" value="4" style="margin-bottom:8px;">
+        <input type="number" id="grid-cols" placeholder="Cols" value="5" style="margin-bottom:8px;">
+      </div>
+      <button class="btn btn-secondary" id="btn-gen-plots">▦ Generate manual grid plots</button>
+      <div class="hint">Splits the boundary into a regular, evenly-sized grid — use this for planned layouts before any imagery exists.</div>
+      <div class="status-msg" id="plots-status"></div>
+
+      <div style="margin-top:14px;">
+        <label>Edit plots</label>
+        <div class="btn-row">
+          <button class="btn btn-secondary" id="btn-toggle-plot-edit">✎ Edit / add / delete plots</button>
+        </div>
+        <div class="hint">Turns on map editing for the current plots — drag a corner to reshape, draw a new polygon to add a plot, or use the trash tool to delete one. Changes save automatically.</div>
+      </div>
+
+      <div style="margin-top:14px;">
+        <label>Import plots</label>
+        <input type="file" id="plots-import-input" accept=".zip,.kml" style="margin-bottom:8px;">
+        <button class="btn btn-secondary" id="btn-import-plots">⬆ Import SHP (.zip) or KML</button>
+        <div class="hint">Already digitized plots elsewhere (QGIS, a trial-management tool)? Import them directly instead of generating or auto-detecting.</div>
+      </div>
+
+      <div style="margin-top:14px;">
+        <label>Management zones</label>
+        <div style="display:flex; gap:8px;">
+          <select id="n-zones" style="margin-bottom:8px;">
+            <option value="3">3 zones</option>
+            <option value="5">5 zones</option>
+          </select>
+          <button class="btn btn-secondary" id="btn-classify-zones" style="margin-bottom:8px;">Classify</button>
+        </div>
+        <div class="hint">Clusters the current index into low/medium/high zones — the basis for a variable-rate prescription file.</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Per-Plot Statistics</h2>
+      <button class="btn btn-secondary" id="btn-plot-stats">Σ Compute per-plot stats (uses last-run index)</button>
+      <div class="hint">Requires a vegetation index to be run first in the left panel (1–3, then ▶ Run) for this same farm — per-plot stats are computed from that cached result, not recomputed from scratch.</div>
+      <div id="plot-stats-table-wrap" class="table-wrap" style="display:none;">
+        <table class="data-table" id="plot-stats-table">
+          <thead><tr><th>Plot</th><th>Row</th><th>Col</th><th>Area (m²)</th><th>Mean</th><th>Min</th><th>Max</th><th>Std</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="table-caption" id="plot-stats-caption"></div>
+
+      <div id="plant-count-table-wrap" class="table-wrap" style="display:none; margin-top:12px;">
+        <table class="data-table" id="plant-count-table">
+          <thead><tr><th>Plot</th><th>Row</th><th>Col</th><th>Plant count</th><th>Mean canopy (m²)</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="table-caption" id="plant-count-caption"></div>
+    </div>
+
+    <div class="section">
+      <h2>Plot &amp; Zone Exports</h2>
+      <div class="btn-row">
+        <button class="btn btn-secondary" id="exp-excel">Excel (plots)</button>
+        <button class="btn btn-secondary" id="exp-shp-plots">SHP (plots)</button>
+      </div>
+      <div class="btn-row" style="margin-top:8px;">
+        <button class="btn btn-secondary" id="exp-shp-zones">SHP (zones / prescription)</button>
+      </div>
+      <div class="btn-row" style="margin-top:8px;">
+        <button class="btn btn-secondary" id="btn-share">🔗 Get share link</button>
+      </div>
+      <div class="status-msg" id="export-status-plots"></div>
+    </div>
+  </div>
+  </div>
+</div>
+
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+<script>
+const API_BASE = "http://127.0.0.1:8000/api";
+
+// ---------------- Map setup ----------------
+const map = L.map('map').setView([9.0765, 7.3986], 12); // default: Abuja, Nigeria
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19,
+  attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+const drawnItems = new L.FeatureGroup();
+map.addLayer(drawnItems);
+
+const drawControl = new L.Control.Draw({
+  edit: { featureGroup: drawnItems },
+  draw: {
+    polygon: { allowIntersection: false, showArea: true, shapeOptions: { color: '#2c7a45' } },
+    rectangle: { shapeOptions: { color: '#2c7a45' } },
+    polyline: false, circle: false, circlemarker: false, marker: false
+  }
+});
+
+let overlayLayer = null;
+let currentBoundaryId = null;
+let currentBoundaries = []; // {id, name, area_ha, geojson}
+let selectedIndex = 'ndvi';
+let selectedLiveScene = null;
+let lastProcessedIndex = null;      // index actually cached on the backend
+let lastProcessedBoundaryId = null; // boundary that index was cached for
+
+const INDEX_META = {
+  ndvi: { label: 'NDVI', sub: 'Vegetation vigor' },
+  ndre: { label: 'NDRE', sub: 'Crop nitrogen/vigor' },
+  ndwi: { label: 'NDWI', sub: 'Surface water' },
+  ndmi: { label: 'NDMI', sub: 'Crop water stress' },
+  savi: { label: 'SAVI', sub: 'Soil-adjusted veg.' },
+  evi:  { label: 'EVI',  sub: 'Enhanced vegetation' },
+};
+
+function buildIndexButtons() {
+  const grid = document.getElementById('index-grid');
+  grid.innerHTML = '';
+  Object.entries(INDEX_META).forEach(([key, meta]) => {
+    const b = document.createElement('button');
+    b.className = 'index-btn' + (key === selectedIndex ? ' active' : '');
+    b.innerHTML = `${meta.label}<span class="sub">${meta.sub}</span>`;
+    b.onclick = () => {
+      selectedIndex = key;
+      document.querySelectorAll('.index-btn').forEach(el => el.classList.remove('active'));
+      b.classList.add('active');
+    };
+    grid.appendChild(b);
+  });
+}
+buildIndexButtons();
+
+function showStatus(id, msg, type) {
+  const el = document.getElementById(id);
+  el.textContent = msg;
+  el.className = `status-msg show ${type}`;
+}
+
+// ---------------- Boundary: draw ----------------
+document.getElementById('btn-draw').onclick = () => {
+  map.addControl(drawControl);
+  showStatus('boundary-status', 'Draw a polygon or rectangle around your farm, then finish the shape.', 'info');
+};
+
+map.on(L.Draw.Event.CREATED, async (e) => {
+  drawnItems.clearLayers();
+  const layer = e.layer;
+  drawnItems.addLayer(layer);
+  map.removeControl(drawControl);
+  const geojson = layer.toGeoJSON().geometry;
+  const name = prompt('Name this farm/field:', 'My Farm') || 'Unnamed Farm';
+  await saveBoundary(name, geojson);
+});
+
+// ---------------- Boundary: upload ----------------
+document.getElementById('btn-upload').onclick = () => document.getElementById('file-input').click();
+document.getElementById('file-input').onchange = async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const text = await file.text();
+  let parsed;
+  try { parsed = JSON.parse(text); }
+  catch { showStatus('boundary-status', 'Invalid JSON file.', 'error'); return; }
+
+  let geometry = parsed;
+  if (parsed.type === 'FeatureCollection') geometry = parsed.features[0].geometry;
+  else if (parsed.type === 'Feature') geometry = parsed.geometry;
+
+  const name = file.name.replace(/\.(json|geojson)$/i, '');
+  await saveBoundary(name, geometry);
+};
+
+async function saveBoundary(name, geometry) {
+  showStatus('boundary-status', 'Saving boundary…', 'info');
+  const form = new FormData();
+  form.append('name', name);
+  form.append('geojson', JSON.stringify(geometry));
+  try {
+    const res = await fetch(`${API_BASE}/boundary`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const data = await res.json();
+    currentBoundaryId = data.boundary_id;
+    currentBoundaries.push({ id: data.boundary_id, name, area_ha: data.area_ha, geojson: geometry });
+    renderFarmList();
+    drawGeoJSONOnMap(geometry);
+    map.fitBounds([[data.bounds[1], data.bounds[0]], [data.bounds[3], data.bounds[2]]]);
+    showStatus('boundary-status', `Saved "${name}" — ${data.area_ha} ha`, 'success');
+    if (typeof loadAnnotations === 'function') loadAnnotations();
+  } catch (err) {
+    showStatus('boundary-status', `Error: ${err.message}`, 'error');
+  }
+}
+
+function drawGeoJSONOnMap(geometry) {
+  drawnItems.clearLayers();
+  const layer = L.geoJSON(geometry, { style: { color: '#2c7a45', weight: 2, fillOpacity: 0.05 } });
+  layer.eachLayer(l => drawnItems.addLayer(l));
+}
+
+function renderFarmList() {
+  const list = document.getElementById('farm-list');
+  list.innerHTML = '';
+  currentBoundaries.forEach(f => {
+    const div = document.createElement('div');
+    div.className = 'farm-item' + (f.id === currentBoundaryId ? ' active' : '');
+    div.innerHTML = `<span>${f.name}</span><span class="area">${f.area_ha} ha</span>`;
+    div.onclick = () => {
+      currentBoundaryId = f.id;
+      drawGeoJSONOnMap(f.geojson);
+      const b = L.geoJSON(f.geojson).getBounds();
+      map.fitBounds(b);
+      renderFarmList();
+    };
+    list.appendChild(div);
+  });
+}
+
+// ---------------- Live scene search ----------------
+document.getElementById('btn-search-live').onclick = async () => {
+  if (!currentBoundaryId) { showStatus('search-status', 'Import or draw a farm boundary first.', 'error'); return; }
+  const start = document.getElementById('date-start').value;
+  const end = document.getElementById('date-end').value;
+  const maxCloud = document.getElementById('max-cloud').value || 30;
+  if (!start || !end) { showStatus('search-status', 'Pick a start and end date.', 'error'); return; }
+
+  showStatus('search-status', 'Searching Sentinel-2 catalog…', 'info');
+  document.getElementById('scene-list').innerHTML = '';
+  try {
+    const url = `${API_BASE}/imagery/search?boundary_id=${currentBoundaryId}&start_date=${start}&end_date=${end}&max_cloud_cover=${maxCloud}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const data = await res.json();
+    if (data.scenes.length === 0) {
+      showStatus('search-status', 'No scenes found for that range/cloud filter.', 'error');
+      return;
+    }
+    showStatus('search-status', `Found ${data.scenes.length} scene(s).`, 'success');
+    renderSceneList(data.scenes);
+  } catch (err) {
+    showStatus('search-status', `${err.message} — try "Run (Demo data)" instead if the backend has no internet access.`, 'error');
+  }
+};
+
+function renderSceneList(scenes) {
+  const el = document.getElementById('scene-list');
+  el.innerHTML = '';
+  scenes.forEach(s => {
+    const div = document.createElement('div');
+    div.className = 'farm-item';
+    div.innerHTML = `<span>${new Date(s.date).toLocaleDateString()}</span><span class="area">☁ ${s.cloud_cover?.toFixed(0)}%</span>`;
+    div.onclick = () => {
+      selectedLiveScene = s.scene_id;
+      document.querySelectorAll('#scene-list .farm-item').forEach(x => x.classList.remove('active'));
+      div.classList.add('active');
+      document.getElementById('btn-process-live').disabled = false;
+    };
+    el.appendChild(div);
+  });
+}
+
+// ---------------- Processing ----------------
+document.getElementById('btn-process-demo').onclick = () => runProcessing(false);
+document.getElementById('btn-process-live').onclick = () => runProcessing(true);
+
+async function runProcessing(live) {
+  if (!currentBoundaryId) { showStatus('process-status', 'Import or draw a farm boundary first.', 'error'); return; }
+  if (live && !selectedLiveScene) { showStatus('process-status', 'Pick a scene from the search results first.', 'error'); return; }
+
+  showStatus('process-status', `<span class="spinner"></span> Processing ${selectedIndex.toUpperCase()}…`, 'info');
+  document.getElementById('process-status').innerHTML = `<span class="spinner"></span> Processing ${selectedIndex.toUpperCase()}…`;
+
+  const form = new FormData();
+  form.append('boundary_id', currentBoundaryId);
+  form.append('index', selectedIndex);
+  const endpoint = live ? '/imagery/process' : '/imagery/process-demo';
+  if (live) form.append('scene_id', selectedLiveScene);
+
+  try {
+    const res = await fetch(`${API_BASE}${endpoint}`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const data = await res.json();
+    renderOverlay(data);
+    lastProcessedIndex = selectedIndex;
+    lastProcessedBoundaryId = currentBoundaryId;
+    showStatus('process-status', `${data.label} rendered${data.demo_mode ? ' (demo data)' : ''}.`, 'success');
+  } catch (err) {
+    showStatus('process-status', `Error: ${err.message}`, 'error');
+  }
+}
+
+function renderOverlay(data) {
+  if (overlayLayer) map.removeLayer(overlayLayer);
+  const bounds = data.overlay_bounds; // [[south, west],[north, east]]
+  overlayLayer = L.imageOverlay(`data:image/png;base64,${data.overlay_png_base64}`, bounds, { opacity: 0.75 })
+    .addTo(map);
+
+  document.getElementById('results-section').style.display = 'block';
+  const s = data.stats;
+  document.getElementById('stat-mean').textContent = s.mean !== null ? s.mean.toFixed(3) : '–';
+  document.getElementById('stat-min').textContent = s.min !== null ? s.min.toFixed(3) : '–';
+  document.getElementById('stat-max').textContent = s.max !== null ? s.max.toFixed(3) : '–';
+  document.getElementById('stat-std').textContent = s.std !== null ? s.std.toFixed(3) : '–';
+  document.getElementById('stat-px').textContent = s.pixel_count;
+
+  document.getElementById('legend-min').textContent = data.value_range[0].toFixed(2);
+  document.getElementById('legend-max').textContent = data.value_range[1].toFixed(2);
+}
+
+// default dates: last 30 days
+const today = new Date();
+const monthAgo = new Date(today.getTime() - 30 * 24 * 3600 * 1000);
+document.getElementById('date-end').value = today.toISOString().slice(0, 10);
+document.getElementById('date-start').value = monthAgo.toISOString().slice(0, 10);
+
+// =====================================================================
+// 4. Plots & Zones
+// =====================================================================
+let plotsLayer = null;
+let zonesLayer = null;
+const ZONE_COLORS_3 = ['#d73027', '#ffffbf', '#1a9850'];
+const ZONE_COLORS_5 = ['#d73027', '#fc8d59', '#ffffbf', '#91cf60', '#1a9850'];
+
+// Editable feature group for plots — lets the user drag/reshape, draw new
+// plots, or delete one, wired to /api/plots/{boundary_id}/edit|add|{plot_id}.
+const plotsEditGroup = new L.FeatureGroup();
+map.addLayer(plotsEditGroup);
+let plotEditControl = null;
+let plotEditModeOn = false;
+let nextManualPlotRow = 0;
+
+document.getElementById('btn-gen-plots').onclick = async () => {
+  if (!currentBoundaryId) { showStatus('plots-status', 'Import or draw a farm boundary first.', 'error'); return; }
+  const rows = document.getElementById('grid-rows').value;
+  const cols = document.getElementById('grid-cols').value;
+  showStatus('plots-status', 'Generating plot grid…', 'info');
+  const form = new FormData();
+  form.append('boundary_id', currentBoundaryId);
+  form.append('rows', rows);
+  form.append('cols', cols);
+  try {
+    const res = await fetch(`${API_BASE}/plots/generate-grid`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const data = await res.json();
+    drawPlotsOnMap(data.plots);
+    showStatus('plots-status', `${data.plot_count} plots generated (${data.rows}×${data.cols}).`, 'success');
+  } catch (err) {
+    showStatus('plots-status', `Error: ${err.message}`, 'error');
+  }
+};
+
+function drawPlotsOnMap(plotList) {
+  if (plotsLayer) map.removeLayer(plotsLayer);
+  plotsEditGroup.clearLayers();
+  plotsLayer = L.geoJSON(plotList.map(p => ({ type: 'Feature', properties: p, geometry: p.geometry })), {
+    style: { color: '#1a1f1c', weight: 1, fillOpacity: 0, dashArray: '3,3' },
+    onEachFeature: (feature, layer) => plotsEditGroup.addLayer(layer)
+  });
+  // plotsLayer itself isn't added to the map — its rendered copies live in
+  // plotsEditGroup so leaflet.draw's edit toolbar can operate on them.
+}
+
+document.getElementById('btn-toggle-plot-edit').onclick = () => {
+  if (!currentBoundaryId) { showStatus('plots-status', 'Import or draw a farm boundary first.', 'error'); return; }
+  plotEditModeOn = !plotEditModeOn;
+  const btn = document.getElementById('btn-toggle-plot-edit');
+  if (plotEditModeOn) {
+    plotEditControl = new L.Control.Draw({
+      position: 'topright',
+      edit: { featureGroup: plotsEditGroup },
+      draw: {
+        polygon: { allowIntersection: false, showArea: true, shapeOptions: { color: '#b3462c' } },
+        rectangle: { shapeOptions: { color: '#b3462c' } },
+        polyline: false, circle: false, circlemarker: false, marker: false
+      }
+    });
+    map.addControl(plotEditControl);
+    btn.textContent = '✓ Done editing plots';
+    showStatus('plots-status', 'Edit mode on — drag corners to reshape, draw to add, trash tool to delete.', 'info');
+  } else {
+    if (plotEditControl) map.removeControl(plotEditControl);
+    btn.textContent = '✎ Edit / add / delete plots';
+    showStatus('plots-status', 'Edit mode off.', 'success');
+  }
+};
+
+map.on(L.Draw.Event.EDITED, async (e) => {
+  if (!currentBoundaryId) return;
+  const layers = e.layers;
+  let count = 0;
+  for (const layer of layers) {
+    const props = layer.feature && layer.feature.properties;
+    if (!props || props.plot_id === undefined) continue;
+    const form = new FormData();
+    form.append('plot_id', props.plot_id);
+    form.append('geojson', JSON.stringify(layer.toGeoJSON().geometry));
+    try {
+      await fetch(`${API_BASE}/plots/${currentBoundaryId}/edit`, { method: 'POST', body: form });
+      count++;
+    } catch (err) { /* keep going for other layers */ }
+  }
+  showStatus('plots-status', `Saved ${count} edited plot(s).`, 'success');
+});
+
+map.on(L.Draw.Event.DELETED, async (e) => {
+  if (!currentBoundaryId) return;
+  const layers = e.layers;
+  let count = 0;
+  for (const layer of layers) {
+    const props = layer.feature && layer.feature.properties;
+    if (!props || props.plot_id === undefined) continue;
+    try {
+      await fetch(`${API_BASE}/plots/${currentBoundaryId}/${props.plot_id}`, { method: 'DELETE' });
+      count++;
+    } catch (err) { /* keep going */ }
+  }
+  showStatus('plots-status', `Deleted ${count} plot(s).`, 'success');
+});
+
+// only fires for shapes drawn while the plot-edit toolbar is active, since the
+// boundary draw toolbar (L.Draw.Event.CREATED handler above) also listens on
+// the same map — distinguish by checking edit mode is on.
+map.on(L.Draw.Event.CREATED, async (e) => {
+  if (!plotEditModeOn || !currentBoundaryId) return;
+  const layer = e.layer;
+  const geometry = layer.toGeoJSON().geometry;
+  const form = new FormData();
+  form.append('geojson', JSON.stringify(geometry));
+  form.append('row', nextManualPlotRow++);
+  form.append('col', 0);
+  try {
+    const res = await fetch(`${API_BASE}/plots/${currentBoundaryId}/add`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const data = await res.json();
+    layer.feature = { type: 'Feature', properties: data, geometry };
+    plotsEditGroup.addLayer(layer);
+    showStatus('plots-status', `Added plot ${data.plot_id}.`, 'success');
+  } catch (err) {
+    showStatus('plots-status', `Error: ${err.message}`, 'error');
+  }
+});
+
+document.getElementById('btn-import-plots').onclick = async () => {
+  if (!currentBoundaryId) { showStatus('plots-status', 'Import or draw a farm boundary first.', 'error'); return; }
+  const fileInput = document.getElementById('plots-import-input');
+  if (!fileInput.files[0]) { showStatus('plots-status', 'Choose a .zip (shapefile) or .kml file first.', 'error'); return; }
+  showStatus('plots-status', 'Importing plots…', 'info');
+  const form = new FormData();
+  form.append('boundary_id', currentBoundaryId);
+  form.append('file', fileInput.files[0]);
+  try {
+    const res = await fetch(`${API_BASE}/plots/import`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const data = await res.json();
+    drawPlotsOnMap(data.plots);
+    showStatus('plots-status', `${data.plot_count} plots imported.`, 'success');
+  } catch (err) {
+    showStatus('plots-status', `Error: ${err.message}`, 'error');
+  }
+};
+
+document.getElementById('btn-plot-stats').onclick = async () => {
+  if (!currentBoundaryId) { showStatus('plots-status', 'Import or draw a farm boundary first.', 'error'); return; }
+  if (!lastProcessedIndex || lastProcessedBoundaryId !== currentBoundaryId) {
+    showStatus('plots-status',
+      'Run a vegetation index for this farm in the left panel first (▶ Run (Demo data)) — per-plot stats reuse that result.',
+      'error');
+    return;
+  }
+  const statsIndex = lastProcessedIndex;
+  showStatus('plots-status', `Computing per-plot ${statsIndex.toUpperCase()} stats…`, 'info');
+  const form = new FormData();
+  form.append('boundary_id', currentBoundaryId);
+  form.append('index', statsIndex);
+  try {
+    const res = await fetch(`${API_BASE}/plots/zonal-stats`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const data = await res.json();
+    // color the plot outlines by mean value as a quick visual
+    const vals = data.plots.map(p => p.mean).filter(v => v !== null);
+    const vmin = Math.min(...vals), vmax = Math.max(...vals);
+    plotsEditGroup.eachLayer(layer => {
+      const pid = layer.feature.properties.plot_id;
+      const stat = data.plots.find(p => p.plot_id === pid);
+      if (stat && stat.mean !== null && vmax > vmin) {
+        const t = (stat.mean - vmin) / (vmax - vmin);
+        const r = Math.round(215 + (26 - 215) * t);
+        const g = Math.round(48 + (152 - 48) * t);
+        const b = Math.round(39 + (80 - 39) * t);
+        layer.setStyle({ fillColor: `rgb(${r},${g},${b})`, fillOpacity: 0.55, weight: 1, color: '#1a1f1c' });
+        layer.bindTooltip(`Plot ${pid}: ${stat.mean.toFixed(3)}`);
+      } else if (stat && stat.mean === null) {
+        layer.setStyle({ fillColor: '#999', fillOpacity: 0.3, weight: 1, color: '#1a1f1c', dashArray: '2,2' });
+        layer.bindTooltip(`Plot ${pid}: no data — ${stat.no_data_reason || 'outside processed area'}`);
+      }
+    });
+    renderPlotStatsTable(data.plots, statsIndex);
+    const msg = data.no_data_count
+      ? `Stats computed for ${data.plot_count} plots — ${data.no_data_count} have no data (see table, greyed on map).`
+      : `Stats computed for ${data.plot_count} plots — colored on map and listed below.`;
+    showStatus('plots-status', msg, data.no_data_count ? 'info' : 'success');
+  } catch (err) {
+    showStatus('plots-status', `Error: ${err.message}`, 'error');
+  }
+};
+
+function renderPlotStatsTable(plots, indexKey) {
+  const wrap = document.getElementById('plot-stats-table-wrap');
+  const tbody = document.querySelector('#plot-stats-table tbody');
+  tbody.innerHTML = '';
+  plots.slice().sort((a, b) => a.plot_id - b.plot_id).forEach(p => {
+    const tr = document.createElement('tr');
+    const fmt = v => (v === null || v === undefined) ? '–' : Number(v).toFixed(3);
+    const meanCell = p.mean === null
+      ? `<span title="${p.no_data_reason || 'no data'}" style="color:var(--danger); cursor:help;">– ⚠</span>`
+      : fmt(p.mean);
+    tr.innerHTML = `<td>${p.plot_id}</td><td>${p.row}</td><td>${p.col}</td>` +
+      `<td>${p.area_m2 ?? '–'}</td><td>${meanCell}</td><td>${fmt(p.min)}</td>` +
+      `<td>${fmt(p.max)}</td><td>${fmt(p.std)}</td>`;
+    tbody.appendChild(tr);
+  });
+  wrap.style.display = plots.length ? 'block' : 'none';
+  document.getElementById('plot-stats-caption').textContent =
+    plots.length ? `${plots.length} plots — ${indexKey.toUpperCase()} (hover ⚠ for why a plot has no data)` : '';
+}
+
+document.getElementById('btn-classify-zones').onclick = async () => {
+  if (!currentBoundaryId) { showStatus('plots-status', 'Import or draw a farm boundary first.', 'error'); return; }
+  const nZones = document.getElementById('n-zones').value;
+  showStatus('plots-status', `Classifying ${nZones} management zones…`, 'info');
+  const form = new FormData();
+  form.append('boundary_id', currentBoundaryId);
+  form.append('index', selectedIndex);
+  form.append('n_zones', nZones);
+  try {
+    const res = await fetch(`${API_BASE}/zones/classify`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const data = await res.json();
+    drawZonesOnMap(data.zones, parseInt(nZones));
+    showStatus('plots-status', `${data.zones.length} zones classified.`, 'success');
+  } catch (err) {
+    showStatus('plots-status', `Error: ${err.message}`, 'error');
+  }
+};
+
+function drawZonesOnMap(zoneList, nZones) {
+  if (zonesLayer) map.removeLayer(zonesLayer);
+  const colors = nZones > 3 ? ZONE_COLORS_5 : ZONE_COLORS_3;
+  zonesLayer = L.geoJSON(zoneList.map(z => ({ type: 'Feature', properties: z, geometry: z.geometry })), {
+    style: (feature) => ({
+      color: '#1a1f1c', weight: 1, fillOpacity: 0.55,
+      fillColor: colors[feature.properties.zone] || '#999'
+    })
+  }).addTo(map);
+  zonesLayer.eachLayer(layer => {
+    const p = layer.feature.properties;
+    layer.bindTooltip(`Zone ${p.zone}: ${p.suggested_rate}`);
+  });
+}
+
+// =====================================================================
+// 5. Exports
+// =====================================================================
+function downloadFrom(url) { window.open(url, '_blank'); }
+
+document.getElementById('exp-geotiff').onclick = () => {
+  if (!currentBoundaryId) { showStatus('export-status', 'Load a farm first.', 'error'); return; }
+  downloadFrom(`${API_BASE}/export/geotiff?boundary_id=${currentBoundaryId}&index=${selectedIndex}`);
+};
+document.getElementById('exp-pdf').onclick = () => {
+  if (!currentBoundaryId) { showStatus('export-status', 'Load a farm first.', 'error'); return; }
+  downloadFrom(`${API_BASE}/export/pdf?boundary_id=${currentBoundaryId}&index=${selectedIndex}`);
+};
+document.getElementById('exp-excel').onclick = () => {
+  if (!currentBoundaryId) { showStatus('export-status-plots', 'Load a farm first.', 'error'); return; }
+  downloadFrom(`${API_BASE}/export/excel/plots?boundary_id=${currentBoundaryId}&index=${selectedIndex}`);
+};
+document.getElementById('exp-shp-plots').onclick = () => {
+  if (!currentBoundaryId) { showStatus('export-status-plots', 'Load a farm first.', 'error'); return; }
+  downloadFrom(`${API_BASE}/export/shp/plots?boundary_id=${currentBoundaryId}`);
+};
+document.getElementById('exp-shp-zones').onclick = () => {
+  if (!currentBoundaryId) { showStatus('export-status-plots', 'Load a farm first.', 'error'); return; }
+  const nZones = document.getElementById('n-zones').value;
+  downloadFrom(`${API_BASE}/export/shp/zones?boundary_id=${currentBoundaryId}&index=${selectedIndex}&n_zones=${nZones}`);
+};
+document.getElementById('btn-share').onclick = async () => {
+  if (!currentBoundaryId) { showStatus('export-status-plots', 'Load a farm first.', 'error'); return; }
+  const form = new FormData();
+  form.append('boundary_id', currentBoundaryId);
+  form.append('index', selectedIndex);
+  try {
+    const res = await fetch(`${API_BASE}/share`, { method: 'POST', body: form });
+    const data = await res.json();
+    const fullUrl = `${API_BASE}${data.share_path}`;
+    await navigator.clipboard.writeText(fullUrl).catch(() => {});
+    showStatus('export-status-plots', `Share link copied: ${fullUrl}`, 'success');
+  } catch (err) {
+    showStatus('export-status-plots', `Error: ${err.message}`, 'error');
+  }
+};
+
+// =====================================================================
+// 6. Drone plant count
+// =====================================================================
+let droneFileId = null;
+let droneImageOverlay = null;
+
+document.getElementById('btn-drone-upload').onclick = async () => {
+  const fileInput = document.getElementById('drone-file-input');
+  if (!fileInput.files[0]) { showStatus('drone-status', 'Choose a .tif file first.', 'error'); return; }
+  showStatus('drone-status', 'Uploading & inspecting orthomosaic…', 'info');
+  const form = new FormData();
+  form.append('file', fileInput.files[0]);
+  try {
+    const res = await fetch(`${API_BASE}/drone/upload`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const data = await res.json();
+    droneFileId = data.drone_file_id;
+    document.getElementById('btn-plant-count').disabled = false;
+    document.getElementById('btn-plant-count-per-plot').disabled = false;
+    document.getElementById('btn-extract-plots').disabled = false;
+
+    // show the uploaded image on the map so there's visual confirmation it loaded
+    if (droneImageOverlay) map.removeLayer(droneImageOverlay);
+    const [west, south, east, north] = data.bounds_wgs84;
+    const overlayBounds = [[south, west], [north, east]];
+    droneImageOverlay = L.imageOverlay(
+      `data:image/png;base64,${data.preview_png_base64}`, overlayBounds, { opacity: 0.95 }
+    ).addTo(map);
+    map.fitBounds(overlayBounds);
+    const toggleBtn = document.getElementById('btn-toggle-drone-overlay');
+    toggleBtn.style.display = 'inline-flex';
+    toggleBtn.textContent = '🖼 Hide image on map';
+    toggleBtn.dataset.visible = 'true';
+
+    showStatus('drone-status',
+      `Loaded: ${data.width}×${data.height}px, ${data.band_count} band(s), ~${(data.resolution_m[0]*100).toFixed(1)}cm/px — shown on map.`,
+      'success');
+  } catch (err) {
+    showStatus('drone-status', `Error: ${err.message}`, 'error');
+  }
+};
+
+document.getElementById('btn-toggle-drone-overlay').onclick = () => {
+  const btn = document.getElementById('btn-toggle-drone-overlay');
+  if (!droneImageOverlay) return;
+  const visible = btn.dataset.visible === 'true';
+  if (visible) {
+    map.removeLayer(droneImageOverlay);
+    btn.textContent = '🖼 Show image on map';
+    btn.dataset.visible = 'false';
+  } else {
+    droneImageOverlay.addTo(map);
+    btn.textContent = '🖼 Hide image on map';
+    btn.dataset.visible = 'true';
+  }
+};
+
+document.getElementById('btn-plant-count').onclick = async () => {
+  if (!droneFileId) return;
+  showStatus('drone-status', 'Detecting plants…', 'info');
+  const form = new FormData();
+  form.append('drone_file_id', droneFileId);
+  if (currentBoundaryId) form.append('boundary_id', currentBoundaryId);
+  try {
+    const res = await fetch(`${API_BASE}/drone/plant-count`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const data = await res.json();
+    showStatus('drone-status', `Detected ${data.plant_count} plants.`, 'success');
+    document.getElementById('drone-result').textContent = data.note;
+  } catch (err) {
+    showStatus('drone-status', `Error: ${err.message}`, 'error');
+  }
+};
+
+document.getElementById('btn-plant-count-per-plot').onclick = async () => {
+  if (!droneFileId) return;
+  if (!currentBoundaryId) { showStatus('drone-status', 'Import or select a boundary first.', 'error'); return; }
+  showStatus('drone-status', 'Counting plants per plot…', 'info');
+  const form = new FormData();
+  form.append('drone_file_id', droneFileId);
+  form.append('boundary_id', currentBoundaryId);
+  try {
+    const res = await fetch(`${API_BASE}/drone/plant-count-per-plot`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const data = await res.json();
+    plotsEditGroup.eachLayer(layer => {
+      const pid = layer.feature.properties.plot_id;
+      const stat = data.plots.find(p => p.plot_id === pid);
+      if (stat) layer.bindTooltip(`Plot ${pid}: ${stat.plant_count} plants`);
+    });
+    renderPlantCountTable(data.plots);
+    showStatus('drone-status', `${data.total_plant_count} plants total across ${data.plot_count} plots — see table and map tooltips.`, 'success');
+  } catch (err) {
+    showStatus('drone-status', `Error: ${err.message}`, 'error');
+  }
+};
+
+function renderPlantCountTable(plots) {
+  const wrap = document.getElementById('plant-count-table-wrap');
+  const tbody = document.querySelector('#plant-count-table tbody');
+  tbody.innerHTML = '';
+  plots.slice().sort((a, b) => a.plot_id - b.plot_id).forEach(p => {
+    const tr = document.createElement('tr');
+    const canopy = (p.mean_canopy_area_m2 === null || p.mean_canopy_area_m2 === undefined) ? '–' : p.mean_canopy_area_m2.toFixed(3);
+    tr.innerHTML = `<td>${p.plot_id}</td><td>${p.row}</td><td>${p.col}</td><td>${p.plant_count}</td><td>${canopy}</td>`;
+    tbody.appendChild(tr);
+  });
+  wrap.style.display = plots.length ? 'block' : 'none';
+  document.getElementById('plant-count-caption').textContent =
+    plots.length ? `${plots.length} plots` : '';
+}
+
+document.getElementById('btn-extract-plots').onclick = async () => {
+  if (!droneFileId) return;
+  const method = document.getElementById('extract-method').value;
+  showStatus('drone-status',
+    method === 'sam' ? 'Running AI segmentation… this can take 1–2 minutes on CPU.' : 'Auto-detecting plots from image…',
+    'info');
+  const form = new FormData();
+  form.append('drone_file_id', droneFileId);
+  form.append('method', method);
+  if (currentBoundaryId) form.append('boundary_id', currentBoundaryId);
+  try {
+    const res = await fetch(`${API_BASE}/plots/extract-from-drone`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const data = await res.json();
+    drawPlotsOnMap(data.plots);
+    showStatus('drone-status', `${data.plot_count} plots auto-detected (${method}) from image${data.saved ? ' and saved' : ''}.`, 'success');
+    document.getElementById('drone-result').textContent =
+      data.saved ? 'Saved to the current boundary — use "Per-plot stats" or the plot exports above.'
+                  : 'Import/select a boundary first to save these and enable per-plot stats.';
+  } catch (err) {
+    showStatus('drone-status', `Error: ${err.message}`, 'error');
+  }
+};
+
+// Check which extraction methods are actually available on this backend
+// (SAM needs torch+timm+weights installed) and disable the option if not.
+(async () => {
+  try {
+    const res = await fetch(`${API_BASE}/plots/extraction-methods`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const select = document.getElementById('extract-method');
+    if (data.sam && !data.sam.available) {
+      const samOption = select.querySelector('option[value="sam"]');
+      if (samOption) {
+        samOption.disabled = true;
+        samOption.textContent += ' — unavailable on this server';
+      }
+    }
+  } catch (err) { /* backend not reachable yet at page load; ignore */ }
+})();
+
+// =====================================================================
+// 7. Annotations
+// =====================================================================
+let annotateMode = false;
+document.getElementById('btn-annotate-mode').onclick = (e) => {
+  annotateMode = !annotateMode;
+  e.target.textContent = annotateMode ? '📍 Click-to-annotate: on' : '📍 Click-to-annotate: off';
+};
+
+map.on('click', async (e) => {
+  if (!annotateMode) return;
+  if (!currentBoundaryId) { alert('Load a farm boundary first.'); return; }
+  const comment = prompt('Note for this location:');
+  if (!comment) return;
+  const form = new FormData();
+  form.append('boundary_id', currentBoundaryId);
+  form.append('lat', e.latlng.lat);
+  form.append('lng', e.latlng.lng);
+  form.append('comment', comment);
+  const res = await fetch(`${API_BASE}/annotations`, { method: 'POST', body: form });
+  if (res.ok) {
+    L.marker(e.latlng).addTo(map).bindPopup(comment).openPopup();
+    loadAnnotations();
+  }
+});
+
+async function loadAnnotations() {
+  if (!currentBoundaryId) return;
+  const res = await fetch(`${API_BASE}/annotations/${currentBoundaryId}`);
+  const data = await res.json();
+  const list = document.getElementById('annotation-list');
+  list.innerHTML = '';
+  data.annotations.forEach(a => {
+    const div = document.createElement('div');
+    div.className = 'farm-item';
+    div.style.cursor = 'default';
+    div.innerHTML = `<span>${a.comment}</span>`;
+    div.onclick = () => map.setView([a.lat, a.lng], 17);
+    list.appendChild(div);
+    L.marker([a.lat, a.lng]).addTo(map).bindPopup(a.comment);
+  });
+}
+</script>
+</body>
+</html>

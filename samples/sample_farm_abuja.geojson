@@ -1,0 +1,14 @@
+{
+  "type": "Feature",
+  "properties": { "name": "Sample Farm - Abuja Outskirts" },
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [[
+      [7.4900, 9.0500],
+      [7.4950, 9.0500],
+      [7.4950, 9.0550],
+      [7.4900, 9.0550],
+      [7.4900, 9.0500]
+    ]]
+  }
+}
