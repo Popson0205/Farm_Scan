@@ -15,12 +15,3 @@ scipy>=1.12
 openpyxl>=3.1
 fiona>=1.9
 reportlab>=4.1
-
-# Optional: only needed for the "AI segmentation" (SAM) plot-extraction method.
-# The app works fully without these -- /api/plots/extraction-methods reports
-# "sam" as unavailable and the frontend greys out that option. See
-# backend/vendor/mobile_sam/ and backend/models/mobile_sam.pt (already
-# vendored in this repo -- no separate download needed) plus README.md's
-# "AI-based plot extraction (MobileSAM)" section for details.
-torch>=2.0
-timm>=0.9

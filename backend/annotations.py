@@ -3,11 +3,12 @@ Share & Collaborate: generates read-only share tokens for a boundary+result,
 and stores annotations (point comments) on a farm — matching Solvi's
 "Annotations and comments" + "Sharing via public web links" features.
 """
+import os
 import secrets
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "farmscan.db"
+DB_PATH = Path(os.environ.get("FARMSCAN_DB", Path(__file__).parent / "farmscan.db"))
 
 
 def get_db():
@@ -81,3 +82,19 @@ def list_annotations(boundary_id: str) -> list[dict]:
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+AUTO_SCOUT_AUTHOR = "FarmScan scout"
+
+
+def replace_auto_scouting_notes(boundary_id: str, notes: list[dict]) -> list[dict]:
+    """Replaces this farm's machine-generated scouting notes with a fresh set
+    (so re-running problem-area detection doesn't pile up duplicates). Notes
+    written by people are never touched. notes: [{lat, lng, comment}]."""
+    conn = get_db()
+    conn.execute("DELETE FROM annotations WHERE boundary_id = ? AND author = ?",
+                 (boundary_id, AUTO_SCOUT_AUTHOR))
+    conn.commit()
+    conn.close()
+    return [add_annotation(boundary_id, n["lat"], n["lng"], n["comment"], AUTO_SCOUT_AUTHOR)
+            for n in notes]

@@ -1,8 +1,10 @@
 import base64
+import os
 import io
 import json
 import sqlite3
 import uuid
+from datetime import date as date_cls
 from pathlib import Path
 
 import numpy as np
@@ -24,9 +26,9 @@ import plant_count as plant_count_mod
 import drone_ingest
 import annotations as annotations_mod
 import plot_import as plot_import_mod
-import sam_plots as sam_plots_mod
+import monitoring as monitoring_mod
 
-DB_PATH = Path(__file__).parent / "farmscan.db"
+DB_PATH = Path(os.environ.get("FARMSCAN_DB", Path(__file__).parent / "farmscan.db"))
 UPLOAD_DIR = Path(__file__).parent / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
@@ -80,6 +82,7 @@ def init_db():
 
 init_db()
 annotations_mod.init_sharing_tables()
+monitoring_mod.init_monitoring_tables()
 
 
 # ---------------------------------------------------------------------------
@@ -195,8 +198,13 @@ async def search_imagery(boundary_id: str, start_date: str, end_date: str, max_c
         scenes = stac_client.search_scenes(geometry, start_date, end_date, max_cloud_cover)
         # strip the href cache before sending to client; keep it server-side keyed by scene_id
         _SCENE_CACHE.update({s["scene_id"]: s["_href_cache"] for s in scenes})
+        _SCENE_META.update({s["scene_id"]: {"date": (s.get("date") or "")[:10],
+                                            "cloud_cover": s.get("cloud_cover"),
+                                            "offset": s.get("_reflectance_offset", 0.0)}
+                            for s in scenes})
         for s in scenes:
             s.pop("_href_cache", None)
+            s.pop("_reflectance_offset", None)
         return {"scenes": scenes, "source": "live"}
     except Exception as e:
         raise HTTPException(
@@ -207,6 +215,7 @@ async def search_imagery(boundary_id: str, start_date: str, end_date: str, max_c
 
 
 _SCENE_CACHE: dict[str, dict] = {}  # scene_id -> band href map, populated by search_imagery
+_SCENE_META: dict[str, dict] = {}   # scene_id -> {date, cloud_cover, offset}
 
 
 # ---------------------------------------------------------------------------
@@ -231,9 +240,16 @@ async def process_imagery(boundary_id: str = Form(...), scene_id: str = Form(...
 
     import stac_client
     bands_needed = INDEX_REGISTRY[index]["bands"]
-    band_arrays, out_meta = stac_client.fetch_and_clip_bands(href_map, boundary_geojson, bands_needed)
+    meta = _SCENE_META.get(scene_id, {})
+    # SCL cloud/shadow masking + common grid + reflectance offset are handled in stac_client
+    band_arrays, out_meta = stac_client.fetch_and_clip_bands(
+        href_map, boundary_geojson, bands_needed, reflectance_offset=meta.get("offset", 0.0))
 
-    return _finish_processing(index, band_arrays, out_meta, boundary_geojson, boundary_id=boundary_id)
+    return _finish_processing(index, band_arrays, out_meta, boundary_geojson, boundary_id=boundary_id,
+                              obs_date=meta.get("date") or date_cls.today().isoformat(),
+                              source="live", scene_id=scene_id,
+                              cloud_cover=meta.get("cloud_cover"),
+                              valid_fraction=out_meta.get("valid_fraction"))
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +257,11 @@ async def process_imagery(boundary_id: str = Form(...), scene_id: str = Form(...
 # ---------------------------------------------------------------------------
 
 @app.post("/api/imagery/process-demo")
-async def process_imagery_demo(boundary_id: str = Form(...), index: str = Form(...)):
+async def process_imagery_demo(boundary_id: str = Form(...), index: str = Form(...),
+                                 obs_date: str = Form(None)):
+    """Offline synthetic run. Optionally pass obs_date (YYYY-MM-DD) to record the result as
+    that date; each date seeds different synthetic data, which lets you exercise the
+    season timeline / alerts without live imagery."""
     if index not in INDEX_REGISTRY:
         raise HTTPException(400, f"Unknown index '{index}'. Choose from {list(INDEX_REGISTRY)}")
 
@@ -252,9 +272,17 @@ async def process_imagery_demo(boundary_id: str = Form(...), index: str = Form(.
         raise HTTPException(404, "Boundary not found")
     boundary_geojson = json.loads(row["geojson"])
 
-    band_arrays, out_meta, field_mask = demo_data.synthetic_bands_for_boundary(boundary_geojson)
+    seed = 0
+    if obs_date:
+        try:
+            seed = date_cls.fromisoformat(obs_date).toordinal()
+        except ValueError:
+            raise HTTPException(400, "obs_date must be YYYY-MM-DD")
+    band_arrays, out_meta, field_mask = demo_data.synthetic_bands_for_boundary(boundary_geojson, seed=seed)
     return _finish_processing(index, band_arrays, out_meta, boundary_geojson, field_mask, demo=True,
-                               boundary_id=boundary_id)
+                               boundary_id=boundary_id,
+                               obs_date=obs_date or date_cls.today().isoformat(),
+                               source="demo", valid_fraction=1.0)
 
 
 def _colorize(index_array: np.ndarray, colormap: str, value_range: tuple) -> Image.Image:
@@ -291,7 +319,9 @@ def _colorize(index_array: np.ndarray, colormap: str, value_range: tuple) -> Ima
 
 def _finish_processing(index: str, band_arrays: dict, out_meta: dict,
                         boundary_geojson: dict, field_mask: np.ndarray = None, demo: bool = False,
-                        boundary_id: str = None):
+                        boundary_id: str = None, obs_date: str = None, source: str = "live",
+                        scene_id: str = None, cloud_cover: float = None,
+                        valid_fraction: float = None):
     idx_array = compute_index(index, band_arrays)
 
     if field_mask is None:
@@ -319,7 +349,19 @@ def _finish_processing(index: str, band_arrays: dict, out_meta: dict,
             "png_bytes": png_bytes,
             "stats": stats,
             "label": spec["label"],
+            "obs_date": obs_date, "source": source,
         }
+
+    # persist the observation so the field builds a season timeline
+    observation = None
+    warning = None
+    if boundary_id and obs_date and stats["pixel_count"] > 0:
+        observation = monitoring_mod.save_observation(
+            boundary_id, index, obs_date, source, idx_array, scene_id=scene_id,
+            cloud_cover=cloud_cover, valid_fraction=valid_fraction)
+        if valid_fraction is not None and valid_fraction < monitoring_mod.MIN_VALID_FRACTION:
+            warning = (f"Only {valid_fraction*100:.0f}% of the field is cloud-free in this image. "
+                       f"It is saved but excluded from trend/alert analysis; pick a clearer scene.")
 
     return JSONResponse({
         "index": index,
@@ -330,11 +372,14 @@ def _finish_processing(index: str, band_arrays: dict, out_meta: dict,
         "value_range": spec["range"],
         "colormap": spec["colormap"],
         "stats": stats,
+        "valid_fraction": valid_fraction,
+        "observation": observation,
+        "warning": warning,
     })
 
 
 # ---------------------------------------------------------------------------
-# Plot extraction (automatic grid, or field-boundary auto-detect)
+# Plot layout (regular grid, manual editing, SHP/KML import)
 # ---------------------------------------------------------------------------
 
 @app.post("/api/plots/generate-grid")
@@ -343,9 +388,10 @@ async def generate_grid_plots(boundary_id: str = Form(...), rows: int = Form(Non
     """Manual/regular grid plot layout: splits the farm boundary into a rows x cols
     grid of evenly-sized trial plots. Use this when you want a uniform layout
     regardless of what's actually visible in imagery (e.g. planning plots before
-    planting). For plots detected automatically from an uploaded drone image's
-    actual planted areas, use /api/plots/extract-from-drone instead. Provide
-    either rows+cols directly, or target_plot_count to auto-estimate a grid."""
+    planting). Plots that already exist elsewhere (QGIS, a trial-management
+    system) can be brought in with /api/plots/import, and any plot can be
+    adjusted with the edit/add/delete endpoints. Provide either rows+cols
+    directly, or target_plot_count to auto-estimate a grid."""
     conn = get_db()
     row = conn.execute("SELECT geojson FROM boundaries WHERE id = ?", (boundary_id,)).fetchone()
     if not row:
@@ -373,94 +419,6 @@ async def generate_grid_plots(boundary_id: str = Form(...), rows: int = Form(Non
     conn.close()
 
     return {"rows": rows, "cols": cols, "plot_count": len(plot_list), "plots": plot_list}
-
-
-@app.post("/api/plots/extract-from-drone")
-async def extract_plots_from_drone(drone_file_id: str = Form(...), boundary_id: str = Form(None),
-                                    min_area_px: int = Form(300), method: str = Form("vegetation")):
-    """
-    Automatic plot extraction: detects individual trial plots directly from an
-    uploaded drone orthomosaic (via /api/drone/upload) — no manual grid is
-    drawn. Each distinct area in the image becomes its own plot, with a
-    best-effort row/col label assigned from plot positions. If boundary_id is
-    given, results are clipped to that boundary and saved so per-plot stats /
-    exports work as usual; otherwise the detected plots are returned without
-    being persisted.
-
-    method:
-      - "vegetation" (default): classical excess-green vegetation-mask +
-        contour detection (plots.py). Fast, no extra dependencies. Assumes
-        plots are distinguished from their surroundings by canopy greenness
-        — works well for young/sparse trial plots on bare soil, poorly when
-        plots are instead delineated by roads/tracks cutting through
-        continuous vegetation.
-      - "sam": zero-shot segmentation using a pretrained model (MobileSAM,
-        see sam_plots.py) instead of a hand-tuned color rule. Better at
-        separating visually-distinct regions in general (including
-        road-delineated plots), but needs torch+timm installed and is much
-        slower on CPU. Falls back with a clear error if unavailable.
-    """
-    file_path = UPLOAD_DIR / f"{drone_file_id}.tif"
-    if not file_path.exists():
-        raise HTTPException(404, "Uploaded drone file not found — upload it via /api/drone/upload first.")
-
-    boundary_geojson = None
-    if boundary_id:
-        conn = get_db()
-        row = conn.execute("SELECT geojson FROM boundaries WHERE id = ?", (boundary_id,)).fetchone()
-        conn.close()
-        if row:
-            boundary_geojson = json.loads(row["geojson"])
-
-    rgb, meta = drone_ingest.load_rgb_for_plant_count(str(file_path), boundary_geojson)
-
-    if method == "sam":
-        ok, reason = sam_plots_mod.sam_available()
-        if not ok:
-            raise HTTPException(
-                400, f"SAM extraction method unavailable ({reason}). Use method=vegetation instead."
-            )
-        try:
-            plot_list = sam_plots_mod.extract_plots_via_sam(rgb, meta["transform"], meta["crs"])
-        except Exception as e:
-            raise HTTPException(500, f"SAM extraction failed: {e}")
-    else:
-        veg_mask = plant_count_mod.excess_green_mask(rgb)
-        plot_list = plots_mod.extract_plots_from_drone_mask(
-            veg_mask, meta["transform"], meta["crs"], min_area_px=min_area_px
-        )
-
-    if boundary_id and plot_list:
-        conn = get_db()
-        conn.execute("DELETE FROM plots WHERE boundary_id = ?", (boundary_id,))
-        for p in plot_list:
-            conn.execute(
-                "INSERT INTO plots (id, boundary_id, plot_id, row_idx, col_idx, geojson, area_m2) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (str(uuid.uuid4()), boundary_id, p["plot_id"], p["row"], p["col"],
-                 json.dumps(p["geometry"]), p["area_m2"]),
-            )
-        conn.commit()
-        conn.close()
-
-    return {
-        "plot_count": len(plot_list),
-        "plots": plot_list,
-        "source": "drone_image_auto_detect",
-        "saved": bool(boundary_id and plot_list),
-    }
-
-
-@app.get("/api/plots/extraction-methods")
-async def extraction_methods():
-    """Reports which plot-extraction methods are currently usable, so the
-    frontend can grey out 'sam' if torch/timm/weights aren't installed rather
-    than letting the user hit a 400 after uploading a file."""
-    sam_ok, sam_reason = sam_plots_mod.sam_available()
-    return {
-        "vegetation": {"available": True, "reason": None},
-        "sam": {"available": sam_ok, "reason": None if sam_ok else sam_reason},
-    }
 
 
 @app.get("/api/plots/{boundary_id}")
@@ -611,29 +569,7 @@ async def import_plots(boundary_id: str = Form(...), file: UploadFile = File(...
     return {"plot_count": len(plot_list), "plots": plot_list, "source": f"imported_{suffix.lstrip('.')}"}
 
 
-@app.post("/api/plots/detect-boundary")
-async def detect_boundary(boundary_id: str = Form(...), index: str = Form("ndvi"),
-                           threshold: float = Form(0.3)):
-    """Automatic field-boundary detection from an already-processed vegetation index
-    raster (run /api/imagery/process-demo or /process for this index+boundary first).
-    Returns candidate polygons the user can accept/edit — useful when you have
-    imagery but haven't digitized a boundary yet."""
-    cache_key = f"{boundary_id}:{index}"
-    cached = _RESULT_CACHE.get(cache_key)
-    if not cached:
-        raise HTTPException(
-            400, f"No processed '{index}' result cached for this boundary yet — "
-                 f"run /api/imagery/process-demo (or /process) with index='{index}' first."
-        )
-
-    veg_mask = plots_mod.veg_mask_from_ndvi(cached["array"], threshold=threshold)
-    candidates = plots_mod.detect_field_boundary(veg_mask, cached["transform"])
-
-    return {"candidate_count": len(candidates), "candidates": candidates}
-
-
-@app.post("/api/plots/zonal-stats")
-async def plots_zonal_stats(boundary_id: str = Form(...), index: str = Form(...)):
+def _compute_plot_stats(boundary_id: str, index: str) -> dict:
     """Per-plot statistics for an already-processed index (Solvi's 'extensive
     statistics for each plot in a single click'). Requires plots to have been
     generated via /api/plots/generate-grid and the index processed already."""
@@ -699,15 +635,44 @@ async def plots_zonal_stats(boundary_id: str = Form(...), index: str = Form(...)
     }
 
 
+
+
+@app.post("/api/plots/zonal-stats")
+async def plots_zonal_stats(boundary_id: str = Form(...), index: str = Form(...)):
+    """Per-plot statistics for an already-processed index (mean/min/max/std/pixel_count per
+    plot). Requires plots (generate-grid / import) and the index processed first."""
+    return _compute_plot_stats(boundary_id, index)
+
+
+@app.post("/api/plots/performance")
+async def plots_performance(boundary_id: str = Form(...), index: str = Form(...)):
+    """Ranks plots against the field baseline (z-score vs median plot), flags
+    underperforming / watch plots, and reports field uniformity and the headroom between
+    the median plot and the top quartile. Uses the cached index raster."""
+    stats = _compute_plot_stats(boundary_id, index)
+    try:
+        ranked = monitoring_mod.rank_plots(stats["plots"])
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"index": index, **ranked}
+
+
 # ---------------------------------------------------------------------------
 # Management zones & prescription export
 # ---------------------------------------------------------------------------
 
 @app.post("/api/zones/classify")
 async def classify_zones_endpoint(boundary_id: str = Form(...), index: str = Form(...),
-                                   n_zones: int = Form(3)):
+                                   n_zones: int = Form(3), base_rate: float = Form(None),
+                                   unit: str = Form("kg/ha"), strategy: str = Form("compensate"),
+                                   spread: float = Form(0.2)):
     """Clusters the index raster into n management zones (e.g. 'low/medium/high
-    vigor') and polygonizes them — the input for a variable-rate prescription file."""
+    vigor') and polygonizes them — the input for a variable-rate prescription file.
+
+    If base_rate is given (the agronomist's flat-rate recommendation, e.g. 90 for kg N/ha),
+    also returns a rate plan: a rate, area and product total per zone plus a comparison with
+    flat-rate application. strategy='compensate' puts more input on weak zones,
+    'capitalize' on strong ones; spread is the max +/- change (0.2 = 20%)."""
     cache_key = f"{boundary_id}:{index}"
     cached = _RESULT_CACHE.get(cache_key)
     if not cached:
@@ -719,10 +684,62 @@ async def classify_zones_endpoint(boundary_id: str = Form(...), index: str = For
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    # cache for export
-    _RESULT_CACHE[f"{boundary_id}:{index}:zones:{n_zones}"] = {"zones": zone_polygons}
+    rate_plan = None
+    if base_rate is not None:
+        px_area = monitoring_mod.pixel_area_m2(cached["transform"], cached["crs"], cached["array"].shape)
+        try:
+            rate_plan = zones_mod.build_rate_plan(zone_polygons, px_area, base_rate, unit, strategy, spread)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
 
-    return {"index": index, "n_zones": n_zones, "zones": zone_polygons}
+    # cache for export
+    _RESULT_CACHE[f"{boundary_id}:{index}:zones:{n_zones}"] = {"zones": zone_polygons, "rate_plan": rate_plan}
+
+    return {"index": index, "n_zones": n_zones, "zones": zone_polygons, "rate_plan": rate_plan}
+
+
+# ---------------------------------------------------------------------------
+# Field monitoring: season timeline, alerts, problem areas -> scouting
+# ---------------------------------------------------------------------------
+
+@app.get("/api/monitoring/history")
+async def monitoring_history(boundary_id: str, index: str = "ndvi", drop_threshold: float = 0.05):
+    """Season timeline for a field: every processed image with its field mean, change vs the
+    previous image and vs the recent baseline, plus alerts for meaningful drops. Images that
+    are too cloudy are listed but excluded from the analysis."""
+    if index not in INDEX_REGISTRY:
+        raise HTTPException(400, f"Unknown index '{index}'")
+    obs = monitoring_mod.list_observations(boundary_id, index)
+    return {"boundary_id": boundary_id, "index": index,
+            **monitoring_mod.analyze_trend(obs, drop_threshold=drop_threshold)}
+
+
+@app.post("/api/monitoring/problem-areas")
+async def monitoring_problem_areas(boundary_id: str = Form(...), index: str = Form("ndvi"),
+                                    sensitivity: float = Form(1.5), min_area_m2: float = Form(400.0),
+                                    create_scouting_notes: bool = Form(False)):
+    """Finds patches clearly below the field's norm in the last processed image, ranked by
+    impact (area x shortfall). With create_scouting_notes=true, drops a note at each patch so a
+    scout knows where to walk first (replaces this farm's previous auto-generated notes;
+    human-written notes are untouched)."""
+    cached = _RESULT_CACHE.get(f"{boundary_id}:{index}")
+    if not cached:
+        raise HTTPException(400, f"No processed '{index}' result cached — process it first.")
+    try:
+        result = monitoring_mod.find_problem_areas(
+            cached["array"], cached["transform"], cached["crs"], index,
+            sensitivity=sensitivity, min_area_m2=min_area_m2)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    notes_created = 0
+    if create_scouting_notes:
+        obs_date = cached.get("obs_date") or ""
+        notes = [{"lat": a["centroid"]["lat"], "lng": a["centroid"]["lng"],
+                  "comment": monitoring_mod.scouting_note_text(a, index, obs_date)}
+                 for a in result["areas"]]
+        notes_created = len(annotations_mod.replace_auto_scouting_notes(boundary_id, notes))
+    return {**result, "obs_date": cached.get("obs_date"), "scouting_notes_created": notes_created}
 
 
 # ---------------------------------------------------------------------------
@@ -769,11 +786,14 @@ async def export_zones_shp(boundary_id: str, index: str, n_zones: int = 3):
     cached = _RESULT_CACHE.get(f"{boundary_id}:{index}:zones:{n_zones}")
     if not cached:
         raise HTTPException(400, "No zones cached — call /api/zones/classify first.")
-    features = [
-        {"geometry": z["geometry"], "zone": z["zone"], "pixel_count": z["pixel_count"],
-         "rate": z["suggested_rate"]}
-        for z in cached["zones"]
-    ]
+    features = []
+    for z in cached["zones"]:
+        f = {"geometry": z["geometry"], "zone": z["zone"], "px_count": z["pixel_count"],
+             "label": z["suggested_rate"]}
+        if "rate" in z:   # agronomist-set rate plan present
+            f.update({"rate": z["rate"], "unit": z["unit"], "area_ha": z["area_ha"],
+                      "product": z["product_total"]})
+        features.append(f)
     zip_bytes = exports_mod.geometries_to_shapefile_zip_bytes(features, layer_name="zones")
     return StreamingResponse(
         io.BytesIO(zip_bytes), media_type="application/zip",
@@ -784,7 +804,7 @@ async def export_zones_shp(boundary_id: str, index: str, n_zones: int = 3):
 @app.get("/api/export/excel/plots")
 async def export_plots_excel(boundary_id: str, index: str):
     """Re-runs the same zonal-stats logic as /api/plots/zonal-stats and returns it as .xlsx."""
-    resp = await plots_zonal_stats(boundary_id=boundary_id, index=index)
+    resp = _compute_plot_stats(boundary_id, index)
     plot_stats = resp["plots"]
     xlsx_bytes = exports_mod.plot_stats_to_excel_bytes(plot_stats, sheet_title=f"{index.upper()} Plot Stats")
     return StreamingResponse(
@@ -885,8 +905,8 @@ async def drone_plant_count_per_plot(drone_file_id: str = Form(...), boundary_id
     """
     Plant counts broken down per plot (Solvi's 'statistics for plant counts' as part
     of per-plot Zonal Statistics), rather than one field-wide total. Requires plots
-    to already exist for this boundary (from /api/plots/generate-grid,
-    /api/plots/extract-from-drone, or /api/plots/import).
+    to already exist for this boundary (from /api/plots/generate-grid or
+    /api/plots/import).
     """
     file_path = UPLOAD_DIR / f"{drone_file_id}.tif"
     if not file_path.exists():

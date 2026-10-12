@@ -1,16 +1,24 @@
 # FarmScan — Open-Satellite & Drone Farm Health Mapping
 
-A working scaffold covering the full feature set: automatic plot/boundary
-extraction, vegetation/water indices, management zones + prescription export,
-plant counts (drone-resolution), and share/collaborate exports — the open-data
-equivalent of Solvi's core feature set.
+Open-data farm health mapping, built to turn imagery into field decisions:
+cloud-masked vegetation/water indices, a season timeline with alerts, problem
+areas ranked for scouting, plot performance ranking, management zones with a
+variable-rate plan, drone plant counts, and share/collaborate exports.
+
+> **Scope note:** automatic plot extraction (vegetation-mask and MobileSAM
+> methods, and automatic field-boundary detection) has been removed. Plots come
+> from a regular grid, from importing an existing SHP/KML layer, or from
+> drawing/editing on the map. That removed the ~800 MB torch dependency and a
+> 39 MB weights download, and avoids plot boundaries that look authoritative
+> but were guessed by a model.
 
 ## Feature map (vs. Solvi)
 
 | Solvi feature | FarmScan equivalent | Data source needed |
 |---|---|---|
 | Plant Counts & Size Estimation (PlantAI™) | `/api/drone/plant-count` — blob/watershed detection + canopy area | **Drone** orthomosaic (cm-res) |
-| Zonal Statistics & Plot Extraction | `/api/plots/generate-grid`, `/api/plots/zonal-stats`, `/api/plots/detect-boundary` | Satellite or drone |
+| Zonal Statistics & Plots | `/api/plots/generate-grid`, `/api/plots/import`, `/api/plots/{id}/edit`, `/api/plots/zonal-stats`, `/api/plots/performance` | Satellite or drone |
+| Season timeline, alerts & scouting | `/api/monitoring/history`, `/api/monitoring/problem-areas` | Satellite (Sentinel-2) |
 | Plant Health Maps & Prescriptions | `/api/imagery/process*` (6 indices) + `/api/zones/classify` | Satellite or drone |
 | Imagery Processing on Autopilot | `/api/imagery/search` (Sentinel-2 STAC) + `/api/drone/upload` | Satellite (auto) / drone (user stitches first) |
 | Share and Collaborate | `/api/annotations`, `/api/share`, `/api/export/*` | — |
@@ -31,14 +39,18 @@ Farm boundary (draw/upload) ──┬─→ Search Sentinel-2 (Planetary Compute
                                │       → Fetch + clip bands → Compute index
                                │       → Color overlay + zonal stats (cached)
                                │
-                               ├─→ Auto-generate grid plots → per-plot stats
-                               │   (reuses the cached index raster)
+                               ├─→ Every run saved as a dated observation
+                               │   → season timeline + drop alerts
                                │
-                               ├─→ Classify into N management zones (KMeans)
-                               │   → polygonize → prescription export
+                               ├─→ Problem areas (patches below the field norm)
+                               │   → ranked, with scouting notes on the map
                                │
-                               └─→ Auto-detect field boundary from veg mask
-                                   (contour detection on thresholded index)
+                               ├─→ Grid / imported / hand-edited plots
+                               │   → per-plot stats → performance ranking
+                               │
+                               └─→ Classify into N management zones (KMeans)
+                                   → rate plan (agronomist's base rate)
+                                   → prescription export
 
 Drone orthomosaic (upload) ──→ Plant blob detection (ExG + watershed)
                                → georeferenced plant points + canopy area
@@ -93,14 +105,23 @@ Visit `http://localhost:5500`. Talks to the backend at `http://127.0.0.1:8000`
 | `/api/imagery/process` | POST | Compute an index on a live scene |
 | `/api/imagery/process-demo` | POST | Same, offline synthetic data |
 
-### Plots & zones (new)
+### Plots & zones
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/api/plots/generate-grid` | POST | Auto-split boundary into a rows×cols plot grid (`rows`+`cols` or `target_plot_count`) |
+| `/api/plots/generate-grid` | POST | Split boundary into a rows×cols plot grid (`rows`+`cols` or `target_plot_count`) |
+| `/api/plots/import` | POST | Import plots from a zipped Shapefile or KML |
 | `/api/plots/{boundary_id}` | GET | List saved plots |
-| `/api/plots/detect-boundary` | POST | Auto-detect field boundary candidates from a processed index (contour detection) |
+| `/api/plots/{boundary_id}/edit` · `/add` · `DELETE /{plot_id}` | POST/DELETE | Edit, add, delete individual plots |
 | `/api/plots/zonal-stats` | POST | Per-plot mean/min/max/std/pixel_count for a processed index |
-| `/api/zones/classify` | POST | KMeans-cluster an index into N management zones + polygons |
+| `/api/plots/performance` | POST | Rank plots vs the field baseline (z-score, flags, uniformity, headroom) |
+| `/api/zones/classify` | POST | KMeans-cluster an index into N zones. Add `base_rate` (+ `unit`, `strategy`, `spread`) for a rate plan |
+
+### Field monitoring
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/monitoring/history` | GET | Season timeline for a field+index: change vs previous/baseline, drop alerts, cloudy images excluded |
+| `/api/monitoring/problem-areas` | POST | Patches clearly below the field norm, ranked by impact; `create_scouting_notes=true` drops notes on the map |
+| `/api/imagery/process-demo` | POST | Accepts optional `obs_date` (YYYY-MM-DD) to simulate a season offline |
 
 ### Exports (new)
 | Endpoint | Method | Purpose |
@@ -140,83 +161,73 @@ VARI (Solvi's RGB-only visible-light index) can be added the same way if
 you want an index that works on plain RGB drone photos without NIR — it's
 not yet in `INDEX_REGISTRY`, add it as `(green - red) / (green + red - blue)`.
 
-## AI-based plot extraction (MobileSAM)
+## Using FarmScan for production decisions
 
-`/api/plots/extract-from-drone` supports two detection methods via the
-`method` form field:
+**1. Watch the season, not a snapshot.** Every index run is saved as a dated
+observation (field mean, spread, share of cloud-free pixels). The timeline flags a
+field that drops ≥0.05 vs the previous image or ≥0.07 vs its recent baseline.
+Images with under 60% clear pixels are kept but excluded from alerts, so a cloud
+can't trigger a false alarm. Natural senescence and harvest also lower vegetation
+indices — an alert is a prompt to look, not a diagnosis.
 
-- **`vegetation`** (default) — classical excess-green vegetation mask +
-  contour detection (`plots.py`). Fast, zero extra dependencies. Assumes
-  plots are distinguishable from their surroundings by canopy greenness —
-  works well for young/sparse trial plots on bare soil, poorly when plots
-  are instead delineated by access roads/tracks cutting through otherwise-
-  continuous vegetation or bare ground (common on real plantation imagery).
-- **`sam`** — zero-shot segmentation using [MobileSAM](https://github.com/ChaoningZhang/MobileSAM),
-  a lightweight distillation of Meta's Segment Anything Model. It has never
-  been trained on farm imagery specifically, but its automatic mask
-  generation mode segments an image into all its visually distinct regions
-  — which, on plantation/field photos, tends to track individual plot
-  boundaries (defined by roads, tone, and texture) far better than a fixed
-  color rule, because it's responding to edge structure jointly rather than
-  one hand-tuned threshold. Validated against real oblique plantation
-  drone photos during development: it cleanly separated nearly every
-  individual cleared block along the true access-road boundaries.
+**2. Know where to walk first.** *Find problem areas* flags contiguous patches
+more than 1.5 robust standard deviations below the field median (sensitivity is
+adjustable), ranks them by area × shortfall, and tells you what to check first for
+the index you ran (e.g. NDRE → nitrogen/chlorophyll; NDMI → water stress). It is
+relative to the field's own distribution, so it needs no per-crop thresholds.
+Ticking *Drop scouting notes* places a note at each patch; re-running replaces
+earlier auto-generated notes and never touches notes written by people.
 
-**What's vendored vs. what you need to install:** the MobileSAM package code
-(`backend/vendor/mobile_sam/`) is included in this repo. Its ~39MB pretrained
-weights are **not** committed to git — that's over GitHub's web-upload UI
-limit and unnecessarily bloats git history for a binary. Fetch them once
-after cloning:
+**3. Find weak plots in a trial or multi-plot field.** *Rank plots* orders plots
+against the field baseline and reports uniformity (CV) and the headroom between the
+median plot and the top quartile.
+
+**4. Turn zones into a rate plan.** Enter your flat-rate recommendation (e.g. 90 kg
+N/ha) and choose a strategy: *more on weak zones* when the shortfall is
+nutrient-limited, *more on strong zones* when weak areas are limited by something
+inputs won't fix (waterlogging, compaction, shallow soil). The plan shows rate, area
+and product per zone and the total vs flat-rate. It redistributes input — any saving
+or yield gain should be validated with a flat-rate strip before you rely on it.
+
+## Accuracy fixes (satellite pipeline)
+
+These change the numbers, so re-run any saved results:
+
+- **Cloud/shadow masking** with the Sentinel-2 Scene Classification Layer (cloud,
+  cirrus, shadow, saturated, snow, no-data are excluded) — important in the Nigerian
+  rainy season, when low scene-level cloud cover can still mean cloud over the field.
+- **Reflectance offset**: scenes processed with baseline ≥ 04.00 carry a +1000 DN
+  offset that was previously ignored, which biased every index (NDVI read too low).
+  The offset is read from the STAC asset metadata with a baseline-based fallback.
+- **Mixed-resolution bands**: NDRE and NDMI combine 10 m and 20 m bands, which
+  previously raised a shape-mismatch error on live data. All bands are now warped to
+  one 10 m grid.
+- **Zone pixel counts** counted polygon fragments instead of pixels; fixed (zone
+  areas and rate totals depend on it).
+- Annotation text is now HTML-escaped in the UI (it was injected as raw HTML).
+
+> The live-imagery changes were verified against synthetic GeoTIFFs (UTM, 10 m and
+> 20 m bands, SCL cloud/shadow blocks) because the build environment can't reach
+> Planetary Computer. Do one live check on first deploy: run NDVI for a known
+> vegetated field and compare its mean against the same scene in Sentinel Hub EO
+> Browser.
+
+## Tests
 
 ```bash
-python3 backend/scripts/download_sam_weights.py
-# or: bash backend/scripts/download_sam_weights.sh
+cd backend
+pip install -r requirements.txt pytest httpx
+python3 -m pytest
 ```
 
-This pulls `mobile_sam.pt` from the upstream MobileSAM GitHub repo into
-`backend/models/mobile_sam.pt` (safe to re-run — skips if already present).
-Add this as a build/deploy step (e.g. a Railway build command) if your
-platform doesn't persist `backend/models/` between deploys. You also need
-`torch` and `timm` installed (`pip install -r requirements.txt` covers this;
-comment those two lines out if you don't want the ~800MB of extra
-dependencies torch brings in — the app runs fine with `vegetation` as the
-only method).
-`GET /api/plots/extraction-methods` reports which methods are actually
-usable at runtime so the frontend can grey out `sam` if the weights/
-dependencies aren't present, instead of failing after upload.
-
-**Performance**: SAM inference is CPU-slow (roughly 1-2 minutes per image at
-default settings on a modest CPU instance — the backend downsamples to a
-768px-longest-side working copy internally to keep memory bounded and avoid
-OOM on small instances). For production use with real orthomosaics, either
-run on a GPU instance (seconds instead of minutes) or keep `points_per_side`
-low. This is a genuine zero-shot use of a general-purpose pretrained model,
-not a farm-specific trained one — for meaningfully better accuracy, the
-natural next step is fine-tuning on a labeled field-boundary dataset. See
-the "Public datasets for a trained model" section below.
-
-### Public datasets for a trained model
-
-If you want to move past zero-shot SAM to an actually-trained field-boundary
-model, these are the most relevant public datasets/models as of writing:
-
-| Resource | What it is |
-|---|---|
-| [AI4Boundaries](https://essd.copernicus.org/articles/15/317/2023/) | 7,831 labeled tiles, 1m aerial ortho + Sentinel-2, vector ground-truth parcel boundaries (EU) |
-| [Fields of the World (FTW)](https://arxiv.org/abs/2409.16252) | Global field-boundary instance segmentation benchmark, built to generalize across countries |
-| [Delineate Anything / FBIS-22M](https://arxiv.org/abs/2504.02534) | 672,909 patches, 22.9M field instance masks, 0.25–10m resolution, with released pretrained weights — worth checking first for a stronger zero-shot baseline than MobileSAM |
-| [AI4SmallFarms](https://github.com/tim-ov/AI4SmallFarms) | 439,001 field polygons, Vietnam/Cambodia smallholder farms — closer to irregular real-world plot shapes than EU rectangles |
-| [DeepGlobe Road Extraction](https://arxiv.org/abs/1805.06561) | 6,226 images, 0.5m/px, road masks, imagery from Thailand/Indonesia/India — closest visual domain match to tropical unpaved plantation roads, useful for the "roads define plot boundaries" approach as an alternative to region segmentation |
-| [Descals et al. global oil-palm map](https://essd.copernicus.org/articles/13/1211/2021/) | Same crop as this deployment; DeepLabv3+ trained on Sentinel-1/2, 10m resolution — good for coarse "where is oil palm" classification, not plot-level boundaries |
-
-Practical path: fine-tune Delineate Anything or an FTW checkpoint on a few
-dozen manually labeled tiles from your own plantation imagery — transfer
-learning from a model already trained on millions of field-boundary
-instances needs far less labeled data than training from scratch.
+Covers problem-area detection, trend alerts, plot ranking, rate-plan maths, STAC band
+handling (offset, cloud mask, mixed resolution), and the full demo-mode API flow.
+Tests use an isolated database via the `FARMSCAN_DB` environment variable, which you
+can also use in deployment to point the SQLite file at a persistent volume.
 
 ## Image acquisition requirements for real deployment
 
-Plot extraction and plant counts both require a **nadir (straight-down)
+Plant counts require a **nadir (straight-down)
 orthomosaic GeoTIFF** stitched from a full drone flight — not a single
 oblique photo (e.g. a phone shot or an angled gimbal capture out the side of
 a plane). Oblique imagery has no consistent ground-sample-distance, so area
@@ -246,28 +257,24 @@ horizon. Tell your users:
    closed-canopy fields (cereals) where plants visually merge. Production
    parity with Solvi's PlantAI needs a crop-specific trained detector
    (e.g. YOLO fine-tuned on your crop imagery).
-2. **No cloud/shadow masking** on satellite imagery yet — apply the
-   Sentinel-2 SCL band before computing indices for production accuracy.
+2. **Cloud masking is per-scene.** Masked pixels become gaps rather than being
+   filled from other dates. In heavy-cloud periods a multi-scene composite
+   (median of the clear pixels across several dates) would give fuller coverage.
 3. **SQLite** is a placeholder — swap for PostGIS (Supabase supports this as
    an extension, and you already use Supabase for GeoEstate) once ready for
    multi-user/production scale.
-4. **Grid-based plot extraction** covers the common trial-layout case
-   (regular rows/cols), and automatic extraction now has two methods —
-   classical vegetation-mask contour detection, and zero-shot AI
-   segmentation (MobileSAM) for road-delineated plots (see "AI-based plot
-   extraction" above). Manual editing (`/api/plots/{boundary_id}/edit`,
-   `/add`, `/{plot_id}` DELETE) and SHP/KML import
-   (`/api/plots/import`) are also now built. What's still missing is a
-   *farm-specific trained* model — both current methods are either a fixed
-   color rule or a general-purpose pretrained model with no farm-imagery
-   fine-tuning; see the public-dataset table above for the path to close
-   that gap.
+4. **Plots are not auto-detected.** Plot layouts come from a regular grid, an
+   imported SHP/KML, or manual drawing/editing. For plantation-style layouts defined by
+   roads and tracks, digitize or import the blocks once; they then persist for every
+   later image.
 5. **Elevation maps** (from Solvi's Plant Health module) aren't implemented —
    would need a DEM source (e.g. Copernicus DEM, also free) and a similar
    fetch+clip pipeline to what `stac_client.py` already does for Sentinel-2.
-6. **Time series / alerting** — not yet built. Each processed result is
-   cached in memory only (cleared on server restart); persisting results
-   with timestamps per field would unlock trend charts and threshold alerts.
+6. **Timeline is field-level.** Observations (field mean/spread) persist in SQLite,
+   but the raster itself is cached in memory only, so problem areas, zones and
+   per-plot stats need the image re-run after a server restart. Per-plot history and
+   push alerts (SMS/WhatsApp/email) are not built yet.
+   Alert thresholds are simple fixed rules — tune them against your own crops.
 7. Area/pixel-size math uses a simple degrees→meters approximation centered
    on the boundary's latitude — fine for display, reproject to a local UTM
    zone for anything contractual.

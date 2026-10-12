@@ -58,11 +58,10 @@ def zones_to_polygons(zone_array: np.ndarray, transform, crs, n_zones: int) -> l
     mask = zone_array >= 0
 
     polygons_by_zone = {}
-    pixel_counts = {}
     for geom_dict, value in rio_shapes(zone_uint, mask=mask, transform=transform):
-        z = int(value)
-        polygons_by_zone.setdefault(z, []).append(shape(geom_dict))
-        pixel_counts[z] = pixel_counts.get(z, 0) + 1
+        polygons_by_zone.setdefault(int(value), []).append(shape(geom_dict))
+    # true pixel count per zone (previously this counted polygon fragments, not pixels)
+    pixel_counts = {z: int((zone_array == z).sum()) for z in polygons_by_zone}
 
     results = []
     for z, geoms in sorted(polygons_by_zone.items()):
@@ -74,3 +73,70 @@ def zones_to_polygons(zone_array: np.ndarray, transform, crs, n_zones: int) -> l
             "suggested_rate": rate_table.get(z, f"Zone {z}"),
         })
     return results
+
+
+# ---------------------------------------------------------------------------
+# Variable-rate plan
+# ---------------------------------------------------------------------------
+
+STRATEGIES = {
+    # Low-vigor zones get MORE input. Typical when the shortfall is nutrient-driven
+    # (e.g. nitrogen top-dress where NDRE is low) and the zone can still respond.
+    "compensate": -1.0,
+    # High-vigor zones get MORE input. Typical when the best-performing areas have the
+    # highest yield potential and weak zones are limited by something inputs won't fix
+    # (waterlogging, compaction, shallow soil).
+    "capitalize": +1.0,
+}
+
+
+def build_rate_plan(zone_polygons: list[dict], px_area_m2: float, base_rate: float,
+                    unit: str = "kg/ha", strategy: str = "compensate",
+                    spread: float = 0.2) -> dict:
+    """
+    Turns classified zones into an actionable rate plan.
+
+    base_rate: the agronomist's flat-rate recommendation for the input (e.g. 90 kg N/ha).
+    spread:    maximum fractional change applied to the extreme zones (0.2 = +/-20%).
+    strategy:  'compensate' or 'capitalize' (see STRATEGIES). Which one is right depends
+               on WHY the weak zones are weak, so it is a choice the agronomist makes,
+               not something the satellite can decide.
+
+    Each zone gets rate, area_ha and product_total. The plan compares total product
+    against applying base_rate everywhere. The difference can be positive or negative:
+    the plan redistributes input, and any saving or yield gain must be validated with a
+    strip trial before it is relied on.
+    """
+    if strategy not in STRATEGIES:
+        raise ValueError(f"strategy must be one of {list(STRATEGIES)}")
+    if base_rate <= 0:
+        raise ValueError("base_rate must be greater than 0")
+    if not 0 <= spread <= 0.5:
+        raise ValueError("spread must be between 0 and 0.5")
+
+    n = len(zone_polygons)
+    direction = STRATEGIES[strategy]
+    total_area_ha = 0.0
+    for z in zone_polygons:
+        z["area_ha"] = round(z["pixel_count"] * px_area_m2 / 10000.0, 4)
+        total_area_ha += z["area_ha"]
+
+    variable_total = 0.0
+    for z in zone_polygons:
+        pos = (2.0 * z["zone"] / (n - 1) - 1.0) if n > 1 else 0.0   # -1 (weakest) .. +1 (strongest)
+        z["rate"] = round(base_rate * (1.0 + direction * spread * pos), 2)
+        z["unit"] = unit
+        z["product_total"] = round(z["rate"] * z["area_ha"], 2)
+        variable_total += z["product_total"]
+
+    flat_total = base_rate * total_area_ha
+    return {
+        "strategy": strategy, "base_rate": base_rate, "unit": unit, "spread": spread,
+        "total_area_ha": round(total_area_ha, 3),
+        "flat_rate_total": round(flat_total, 2),
+        "variable_rate_total": round(variable_total, 2),
+        "difference": round(variable_total - flat_total, 2),
+        "difference_pct": round(100.0 * (variable_total - flat_total) / flat_total, 2) if flat_total else None,
+        "note": ("Rates redistribute input across zones. Validate against a flat-rate strip "
+                 "before relying on any saving or yield gain."),
+    }

@@ -11,8 +11,6 @@
 #
 # Requirements: git installed and authenticated (HTTPS: a GitHub personal
 # access token when prompted, or SSH: your key already added to GitHub).
-# The MobileSAM weights are intentionally NOT included (see .gitignore) --
-# run backend/scripts/download_sam_weights.py after cloning to fetch them.
 #
 # UPDATING AN EXISTING REPO: if this folder was freshly extracted (e.g. from
 # a new zip) and has no git history of its own, but the target GitHub repo
@@ -49,15 +47,6 @@ echo "== Working directory: $SCRIPT_DIR =="
 if ! command -v git >/dev/null 2>&1; then
   echo "Error: git is not installed." >&2
   exit 1
-fi
-
-# Warn (don't fail) if the SAM weights somehow ended up present -- they
-# should stay out of git per .gitignore, but double-check just in case
-# someone re-added them locally, since a 39MB binary in a commit defeats
-# the point of keeping this repo small.
-if [ -f "backend/models/mobile_sam.pt" ]; then
-  echo "Note: backend/models/mobile_sam.pt exists locally but is gitignored --"
-  echo "      it will NOT be pushed. That's expected; see README.md."
 fi
 
 # --- Init repo if needed -------------------------------------------------
@@ -133,6 +122,4 @@ rm -f /tmp/push_error.log
 echo ""
 echo "Done. Pushed to $REPO_URL ($BRANCH)."
 echo "Reminder: after cloning elsewhere, run"
-echo "  python3 backend/scripts/download_sam_weights.py"
-echo "to fetch the MobileSAM weights (not stored in git)."
 

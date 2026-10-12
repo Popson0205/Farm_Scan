@@ -90,7 +90,7 @@ def pixel_centroids_to_geojson_points(centroids_px: list, areas_px: list, transf
 
     If crs is given and isn't already EPSG:4326, points are reprojected into
     EPSG:4326 so they line up with boundaries, plots, and the map — same fix
-    applied to plots.py's extract_plots_from_drone_mask()."""
+    applied to every other georeferenced output."""
     # pixel size in map units (assumes transform is in meters, e.g. a UTM-projected
     # drone orthomosaic — the normal case for stitched drone output)
     px_area_m2 = abs(transform.a * transform.e)

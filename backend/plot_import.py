@@ -2,7 +2,7 @@
 Imports existing plot boundaries from SHP (zipped shapefile) or KML files,
 for trials where plots were already digitized elsewhere (QGIS, a trial
 management system, etc.) — Solvi's "Import existing plots from SHP and KML
-files" as part of Zonal Statistics / Plot Extraction.
+files" as part of Zonal Statistics / Plot Extraction (import path).
 """
 import io
 import tempfile
@@ -17,9 +17,8 @@ from shapely.geometry import mapping
 def _row_col_from_attrs_or_grid(gdf: gpd.GeoDataFrame) -> list[tuple]:
     """
     If the imported file already has row/col-like attribute columns, use them;
-    otherwise fall back to spatially clustering centroids into a grid, the same
-    approach used for auto-detected plots (plots.py's _assign_grid_positions),
-    so imported plots still get sensible labels for display/export ordering.
+    otherwise return None and the caller labels plots sequentially (row 0,
+    col = file order).
     """
     cols_lower = {c.lower(): c for c in gdf.columns}
     row_col = None
