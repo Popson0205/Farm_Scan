@@ -186,9 +186,11 @@ async def list_indices():
 # ---------------------------------------------------------------------------
 
 @app.get("/api/imagery/search")
-async def search_imagery(boundary_id: str, start_date: str, end_date: str, max_cloud_cover: float = 30.0):
-    """Search Sentinel-2 scenes covering the boundary. Requires outbound network access
-    to planetarycomputer.microsoft.com — falls back with a clear error if unreachable."""
+async def search_imagery(boundary_id: str, start_date: str, end_date: str, max_cloud_cover: float = 30.0,
+                         max_scenes: int = 10):
+    """Search Sentinel-2 scenes. Returns only the best `max_scenes` (default 10) that cover the
+    whole boundary, clearest first. Requires outbound network access to
+    planetarycomputer.microsoft.com — falls back with a clear error if unreachable."""
     conn = get_db()
     row = conn.execute("SELECT geojson FROM boundaries WHERE id = ?", (boundary_id,)).fetchone()
     conn.close()
@@ -198,7 +200,9 @@ async def search_imagery(boundary_id: str, start_date: str, end_date: str, max_c
     try:
         import stac_client
         geometry = json.loads(row["geojson"])
-        scenes = stac_client.search_scenes(geometry, start_date, end_date, max_cloud_cover)
+        found = stac_client.search_scenes_detailed(geometry, start_date, end_date, max_cloud_cover,
+                                                   limit=max(1, min(int(max_scenes), 50)))
+        scenes = found["scenes"]
         # strip the href cache before sending to client; keep it server-side keyed by scene_id
         _SCENE_CACHE.update({s["scene_id"]: s["_href_cache"] for s in scenes})
         _SCENE_META.update({s["scene_id"]: {"date": (s.get("date") or "")[:10],
@@ -208,7 +212,9 @@ async def search_imagery(boundary_id: str, start_date: str, end_date: str, max_c
         for s in scenes:
             s.pop("_href_cache", None)
             s.pop("_reflectance_offset", None)
-        return {"scenes": scenes, "source": "live"}
+        return {"scenes": scenes, "source": "live",
+                "checked": found["checked"], "fully_covering": found["fully_covering"],
+                "max_scenes": max(1, min(int(max_scenes), 50))}
     except Exception as e:
         raise HTTPException(
             502,

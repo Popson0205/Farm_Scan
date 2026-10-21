@@ -203,6 +203,16 @@
       <h2>Results</h2>
       <div id="legend"></div>
       <div id="legend-labels"><span id="legend-min"></span><span id="legend-max"></span></div>
+      <div style="margin:10px 0 4px;">
+        <label for="overlay-opacity" style="display:flex; justify-content:space-between;">
+          <span>Overlay opacity</span><b id="opacity-val" style="color:var(--green-700);">90%</b>
+        </label>
+        <div style="display:flex; align-items:center; gap:6px;">
+          <button class="btn btn-secondary" id="opacity-down" title="Less opaque" style="width:auto; padding:3px 11px;">−</button>
+          <input type="range" id="overlay-opacity" min="0" max="100" step="1" value="90" style="flex:1; accent-color:var(--green-600); cursor:pointer;">
+          <button class="btn btn-secondary" id="opacity-up" title="More opaque" style="width:auto; padding:3px 11px;">+</button>
+        </div>
+      </div>
       <div id="stats-box" class="show">
         <div class="row"><span>Mean</span><b id="stat-mean">–</b></div>
         <div class="row"><span>Min</span><b id="stat-min">–</b></div>
@@ -417,6 +427,7 @@ const drawControl = new L.Control.Draw({
 });
 
 let overlayLayer = null;
+let overlayOpacity = 0.9;   // user-adjustable via the Results slider
 let currentBoundaryId = null;
 let currentBoundaries = []; // {id, name, area_ha, geojson}
 let selectedIndex = 'ndvi';
@@ -551,10 +562,13 @@ document.getElementById('btn-search-live').onclick = async () => {
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
     const data = await res.json();
     if (data.scenes.length === 0) {
-      showStatus('search-status', 'No scenes found for that range/cloud filter.', 'error');
+      showStatus('search-status', data.checked > 0
+        ? `${data.checked} scene(s) touch your plot but none cover all of it. Try a wider date range or a higher cloud limit.`
+        : 'No scenes found for that range/cloud filter.', 'error');
       return;
     }
-    showStatus('search-status', `Found ${data.scenes.length} scene(s).`, 'success');
+    const more = data.fully_covering > data.scenes.length ? ` of ${data.fully_covering} that cover it` : '';
+    showStatus('search-status', `Showing the best ${data.scenes.length} scene(s)${more}, clearest first. Each covers your whole plot.`, 'success');
     renderSceneList(data.scenes);
   } catch (err) {
     showStatus('search-status', `${err.message} — try "Run (Demo data)" instead if the backend has no internet access.`, 'error');
@@ -564,10 +578,11 @@ document.getElementById('btn-search-live').onclick = async () => {
 function renderSceneList(scenes) {
   const el = document.getElementById('scene-list');
   el.innerHTML = '';
-  scenes.forEach(s => {
+  scenes.forEach((s, i) => {
     const div = document.createElement('div');
     div.className = 'farm-item';
-    div.innerHTML = `<span>${new Date(s.date).toLocaleDateString()}</span><span class="area">☁ ${s.cloud_cover?.toFixed(0)}%</span>`;
+    div.title = s.coverage_pct != null ? `Covers ${s.coverage_pct}% of your plot` : '';
+    div.innerHTML = `<span>${i + 1}. ${new Date(s.date).toLocaleDateString()}</span><span class="area">☁ ${s.cloud_cover?.toFixed(0)}%</span>`;
     div.onclick = () => {
       selectedLiveScene = s.scene_id;
       document.querySelectorAll('#scene-list .farm-item').forEach(x => x.classList.remove('active'));
@@ -611,7 +626,7 @@ async function runProcessing(live) {
 function renderOverlay(data) {
   if (overlayLayer) map.removeLayer(overlayLayer);
   const bounds = data.overlay_bounds; // [[south, west],[north, east]]
-  overlayLayer = L.imageOverlay(`data:image/png;base64,${data.overlay_png_base64}`, bounds, { opacity: 0.75 })
+  overlayLayer = L.imageOverlay(`data:image/png;base64,${data.overlay_png_base64}`, bounds, { opacity: overlayOpacity })
     .addTo(map);
 
   document.getElementById('results-section').style.display = 'block';
@@ -625,6 +640,18 @@ function renderOverlay(data) {
   document.getElementById('legend-min').textContent = data.value_range[0].toFixed(2);
   document.getElementById('legend-max').textContent = data.value_range[1].toFixed(2);
 }
+
+// ---------------- Overlay opacity (drag the slider, or use - / +) ----------------
+function setOverlayOpacity(pct) {
+  pct = Math.max(0, Math.min(100, Math.round(pct)));
+  overlayOpacity = pct / 100;
+  document.getElementById('overlay-opacity').value = pct;
+  document.getElementById('opacity-val').textContent = `${pct}%`;
+  if (overlayLayer) overlayLayer.setOpacity(overlayOpacity);   // live while dragging
+}
+document.getElementById('overlay-opacity').addEventListener('input', e => setOverlayOpacity(+e.target.value));
+document.getElementById('opacity-down').onclick = () => setOverlayOpacity(overlayOpacity * 100 - 5);
+document.getElementById('opacity-up').onclick = () => setOverlayOpacity(overlayOpacity * 100 + 5);
 
 // default dates: last 30 days
 const today = new Date();

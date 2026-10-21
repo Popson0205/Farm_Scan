@@ -77,36 +77,78 @@ def _reflectance_offset(item) -> float:
     return 0.0
 
 
-def search_scenes(geojson_geometry: dict, start_date: str, end_date: str,
-                   max_cloud_cover: float = 30.0, limit: int = 12) -> list[dict]:
-    """
-    Search for Sentinel-2 scenes intersecting a farm boundary polygon.
+MAX_SCENES_DEFAULT = 10      # how many scenes the user is shown
+CANDIDATE_POOL = 100         # lowest-cloud scenes pulled from the catalog before filtering by coverage
+MIN_COVERAGE = 0.99          # a scene "covers the plot" if it contains >= 99% of the boundary area
 
-    geojson_geometry: a GeoJSON Polygon/MultiPolygon geometry dict (the farm boundary)
-    start_date / end_date: 'YYYY-MM-DD'
-    Returns a list of lightweight scene summaries (not full imagery) for the user to pick from.
+
+def coverage_fraction(item_geometry: dict, boundary_geojson: dict) -> float:
+    """Share of the farm boundary (0-1) that lies inside a scene's data footprint.
+    `intersects` in a STAC search is satisfied by a scene that merely touches the plot,
+    which near tile edges gives images with the field cut in half."""
+    from shapely.geometry import shape
+    boundary = shape(boundary_geojson)
+    if boundary.is_empty or boundary.area <= 0:
+        return 0.0
+    return float(boundary.intersection(shape(item_geometry)).area / boundary.area)
+
+
+def select_best_scenes(candidates: list[dict], limit: int = MAX_SCENES_DEFAULT,
+                       min_coverage: float = MIN_COVERAGE) -> tuple[list[dict], int]:
+    """
+    Pure selection logic. `candidates`: dicts with 'cloud_cover', 'date' (ISO string) and
+    'coverage' (0-1). Keeps scenes that cover the plot, orders them by cloud cover (lowest
+    first; newest first on ties) and returns (best `limit` scenes, count that fully cover).
+    """
+    covering = [c for c in candidates if c.get("coverage", 0.0) >= min_coverage]
+    covering.sort(key=lambda c: c.get("date") or "", reverse=True)               # newest first ...
+    covering.sort(key=lambda c: 101.0 if c.get("cloud_cover") is None else c["cloud_cover"])  # ... then stable by cloud
+    return covering[:max(1, int(limit))], len(covering)
+
+
+def search_scenes_detailed(geojson_geometry: dict, start_date: str, end_date: str,
+                           max_cloud_cover: float = 30.0, limit: int = MAX_SCENES_DEFAULT) -> dict:
+    """
+    Sentinel-2 scenes for a farm boundary: only scenes that cover the whole plot, clearest
+    first, capped at `limit` (default 10). Returns
+      {"scenes": [...], "checked": n scenes examined, "fully_covering": n that cover the plot}.
+
+    Note: pystac-client's `limit` is the page SIZE, not a cap (iterating still walks every
+    page), so the cap is `max_items` plus our own selection.
     """
     import planetary_computer
     from pystac_client import Client
 
     catalog = Client.open(STAC_API_URL)
-
     search = catalog.search(
         collections=[COLLECTION],
         intersects=geojson_geometry,
         datetime=f"{start_date}/{end_date}",
         query={"eo:cloud_cover": {"lt": max_cloud_cover}},
-        limit=limit,
+        limit=CANDIDATE_POOL,
+        max_items=CANDIDATE_POOL,
         sortby=[{"field": "properties.eo:cloud_cover", "direction": "asc"}],
     )
 
+    candidates = []
+    for item in search.items():                      # unsigned: signing is only needed for the winners
+        candidates.append({
+            "item": item,
+            "date": item.properties.get("datetime"),
+            "cloud_cover": item.properties.get("eo:cloud_cover"),
+            "coverage": coverage_fraction(item.geometry, geojson_geometry),
+        })
+
+    chosen, n_covering = select_best_scenes(candidates, limit)
+
     results = []
-    for item in search.item_collection():
-        signed = planetary_computer.sign(item)
+    for c in chosen:
+        signed = planetary_computer.sign(c["item"])
         results.append({
             "scene_id": signed.id,
             "date": signed.properties.get("datetime"),
             "cloud_cover": signed.properties.get("eo:cloud_cover"),
+            "coverage_pct": round(c["coverage"] * 100, 1),
             "platform": signed.properties.get("platform"),
             "thumbnail_url": signed.assets.get("rendered_preview", {}).href
                 if signed.assets.get("rendered_preview") else None,
@@ -114,7 +156,13 @@ def search_scenes(geojson_geometry: dict, start_date: str, end_date: str,
                              for role, key in ASSET_MAP.items() if key in signed.assets},
             "_reflectance_offset": _reflectance_offset(signed),
         })
-    return results
+    return {"scenes": results, "checked": len(candidates), "fully_covering": n_covering}
+
+
+def search_scenes(geojson_geometry: dict, start_date: str, end_date: str,
+                  max_cloud_cover: float = 30.0, limit: int = MAX_SCENES_DEFAULT) -> list[dict]:
+    """Convenience wrapper returning just the scene list (see search_scenes_detailed)."""
+    return search_scenes_detailed(geojson_geometry, start_date, end_date, max_cloud_cover, limit)["scenes"]
 
 
 def _read_on_grid(href: str, crs, transform, width: int, height: int,
