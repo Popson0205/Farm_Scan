@@ -1,0 +1,85 @@
+{
+  "_about": "Starter crop requirements for FAO-style land suitability scoring. Each factor is a trapezoid [abs_min, opt_min, opt_max, abs_max]: score 0 outside [abs_min, abs_max], 1 inside [opt_min, opt_max], linear in between. null = open-ended. Values are approximate, drawn from the general FAO / EcoCrop literature for rainfed production in the tropics; CALIBRATE THEM with a local agronomist or your national extension service before relying on them. Rain is the total over the crop cycle (cycle_days); 'establish' is rain in the first 30 days after planting (germination/establishment), which is what makes planting before the rains onset fail. Soil factors use the 0-30 cm topsoil. Drainage maps HWSD drainage class 1 (excessive) .. 7 (very poorly drained) to a 0-1 score.",
+  "crops": {
+    "maize": {
+      "label": "Maize", "cycle_days": 120,
+      "factors": {
+        "tmean": [14, 20, 30, 36], "rain": [350, 500, 900, 1500], "establish": [15, 50, null, null],
+        "ph": [4.5, 5.5, 7.5, 8.5], "organic_carbon": [0.2, 1.0, null, null],
+        "clay": [5, 12, 40, 60], "sand": [0, 0, 65, 85],
+        "cec": [3, 8, null, null], "ec": [0, 0, 2, 8], "coarse": [0, 0, 15, 60]
+      },
+      "drainage": {"1": 0.5, "2": 0.8, "3": 1.0, "4": 0.9, "5": 0.55, "6": 0.25, "7": 0.1}
+    },
+    "rice": {
+      "label": "Rice (rainfed lowland)", "cycle_days": 130,
+      "factors": {
+        "tmean": [18, 22, 32, 38], "rain": [700, 1000, 1800, 3000], "establish": [30, 80, null, null],
+        "ph": [4.0, 5.0, 7.5, 8.5], "organic_carbon": [0.3, 1.0, null, null],
+        "clay": [10, 25, 60, 80], "sand": [0, 0, 50, 75],
+        "cec": [3, 8, null, null], "ec": [0, 0, 3, 10], "coarse": [0, 0, 10, 40]
+      },
+      "drainage": {"1": 0.2, "2": 0.35, "3": 0.6, "4": 0.8, "5": 0.95, "6": 1.0, "7": 1.0}
+    },
+    "cassava": {
+      "label": "Cassava", "cycle_days": 300,
+      "factors": {
+        "tmean": [16, 22, 30, 38], "rain": [600, 1000, 1800, 3000], "establish": [10, 30, null, null],
+        "ph": [4.0, 5.0, 7.0, 8.0], "organic_carbon": [0.1, 0.6, null, null],
+        "clay": [5, 10, 35, 55], "sand": [0, 0, 75, 90],
+        "cec": [2, 5, null, null], "ec": [0, 0, 1.5, 6], "coarse": [0, 0, 20, 60]
+      },
+      "drainage": {"1": 0.5, "2": 0.8, "3": 1.0, "4": 0.8, "5": 0.4, "6": 0.15, "7": 0.05}
+    },
+    "sorghum": {
+      "label": "Sorghum", "cycle_days": 110,
+      "factors": {
+        "tmean": [16, 22, 32, 38], "rain": [250, 400, 800, 1400], "establish": [15, 45, null, null],
+        "ph": [4.5, 5.5, 8.0, 9.0], "organic_carbon": [0.2, 0.8, null, null],
+        "clay": [5, 15, 50, 70], "sand": [0, 0, 70, 88],
+        "cec": [3, 6, null, null], "ec": [0, 0, 4, 12], "coarse": [0, 0, 20, 60]
+      },
+      "drainage": {"1": 0.5, "2": 0.8, "3": 1.0, "4": 1.0, "5": 0.8, "6": 0.5, "7": 0.25}
+    },
+    "soybean": {
+      "label": "Soybean", "cycle_days": 110,
+      "factors": {
+        "tmean": [15, 20, 30, 36], "rain": [350, 450, 800, 1300], "establish": [15, 50, null, null],
+        "ph": [4.5, 5.8, 7.0, 8.0], "organic_carbon": [0.2, 1.0, null, null],
+        "clay": [5, 15, 45, 60], "sand": [0, 0, 65, 85],
+        "cec": [3, 8, null, null], "ec": [0, 0, 2, 6], "coarse": [0, 0, 15, 50]
+      },
+      "drainage": {"1": 0.5, "2": 0.8, "3": 1.0, "4": 0.9, "5": 0.55, "6": 0.25, "7": 0.1}
+    },
+    "yam": {
+      "label": "Yam", "cycle_days": 240,
+      "factors": {
+        "tmean": [20, 24, 30, 36], "rain": [700, 1000, 1500, 2500], "establish": [10, 30, null, null],
+        "ph": [4.5, 5.5, 7.0, 8.0], "organic_carbon": [0.3, 1.2, null, null],
+        "clay": [3, 8, 30, 45], "sand": [0, 0, 70, 85],
+        "cec": [3, 8, null, null], "ec": [0, 0, 1.5, 5], "coarse": [0, 0, 10, 40]
+      },
+      "drainage": {"1": 0.5, "2": 0.8, "3": 1.0, "4": 0.8, "5": 0.4, "6": 0.15, "7": 0.05}
+    },
+    "groundnut": {
+      "label": "Groundnut (peanut)", "cycle_days": 110,
+      "factors": {
+        "tmean": [18, 22, 30, 36], "rain": [300, 450, 800, 1200], "establish": [15, 50, null, null],
+        "ph": [4.5, 5.5, 7.0, 8.0], "organic_carbon": [0.1, 0.6, null, null],
+        "clay": [2, 5, 25, 40], "sand": [0, 0, 85, 95],
+        "cec": [2, 5, null, null], "ec": [0, 0, 2, 6], "coarse": [0, 0, 10, 40]
+      },
+      "drainage": {"1": 0.5, "2": 0.8, "3": 1.0, "4": 0.8, "5": 0.4, "6": 0.15, "7": 0.05}
+    },
+    "cowpea": {
+      "label": "Cowpea", "cycle_days": 80,
+      "factors": {
+        "tmean": [18, 22, 32, 38], "rain": [200, 300, 600, 1000], "establish": [15, 40, null, null],
+        "ph": [4.5, 5.5, 7.5, 8.5], "organic_carbon": [0.1, 0.6, null, null],
+        "clay": [2, 8, 35, 55], "sand": [0, 0, 80, 92],
+        "cec": [2, 5, null, null], "ec": [0, 0, 2.5, 8], "coarse": [0, 0, 20, 60]
+      },
+      "drainage": {"1": 0.5, "2": 0.8, "3": 1.0, "4": 0.8, "5": 0.45, "6": 0.2, "7": 0.05}
+    }
+  }
+}

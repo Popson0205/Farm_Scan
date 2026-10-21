@@ -236,6 +236,17 @@
     </div>
 
     <div class="section">
+      <h2>Site Suitability</h2>
+      <div class="hint" style="margin:0 0 10px;">Soil (FAO HWSD) + weather history (Open-Meteo) &rarr; which crops fit this farm, when to plant, and what limits them. Screening-grade: confirm with a soil test.</div>
+      <label>Planting date <span style="font-weight:400; color:#5c6b62;">(optional &mdash; blank = find the best window)</span></label>
+      <input type="text" id="suit-planting" placeholder="e.g. 05-20 or 2027-05-20">
+      <button class="btn btn-primary" id="btn-suitability" style="margin-top:8px;">🌱 Analyze crop suitability</button>
+      <button class="btn btn-secondary" id="btn-forecast" style="margin-top:8px;">🌦 7-day forecast &amp; advisories</button>
+      <div id="suit-box" style="display:none; margin-top:10px;"></div>
+      <div class="status-msg" id="suit-status"></div>
+    </div>
+
+    <div class="section">
       <h2>Vegetation Exports</h2>
       <div class="btn-row">
         <button class="btn btn-secondary" id="exp-geotiff">GeoTIFF</button>
@@ -1251,6 +1262,87 @@ async function loadAnnotations() {
     L.marker([a.lat, a.lng]).addTo(annotationLayer).bindPopup(esc(a.comment));
   });
 }
+
+// =====================================================================
+// 6c. Site suitability: soil (HWSD) + weather -> ranked crops, planting windows
+// =====================================================================
+const CLASS_COLOR = { S1: '#2c7a45', S2: '#6a9f3a', S3: '#e08a2c', N: '#b3462c' };
+const SCORE_COLOR = s => s >= 0.8 ? '#2c7a45' : s >= 0.6 ? '#6a9f3a' : s >= 0.4 ? '#e08a2c' : '#b3462c';
+
+function suitFactorRows(factors) {
+  return factors.map(f => `<tr>
+      <td>${esc(f.label)}</td>
+      <td>${esc(f.value)}${f.unit ? ' ' + esc(f.unit) : ''}</td>
+      <td><span style="display:inline-block; width:${Math.round(f.score * 60)}px; height:8px; background:${SCORE_COLOR(f.score)}; border-radius:4px;"></span> ${f.score.toFixed(2)}</td>
+    </tr>`).join('');
+}
+
+function renderSuitability(data) {
+  const box = document.getElementById('suit-box');
+  box.style.display = 'block';
+  const t = data.soil.topsoil_0_30cm;
+  const soilLine = [t.texture_class, t.ph_water != null ? `pH ${t.ph_water}` : null,
+                    t.organic_carbon_pct != null ? `OC ${t.organic_carbon_pct}%` : null,
+                    t.cec_cmol_kg != null ? `CEC ${t.cec_cmol_kg}` : null].filter(Boolean).map(esc).join(' · ');
+  const interp = data.soil.interpretation
+    .filter(i => i.property !== 'Texture')
+    .map(i => `<div style="font-size:12px;"><b>${esc(i.property)}:</b> ${esc(i.value)}${i.unit ? ' ' + esc(i.unit) : ''} — ${esc(i.level)}</div>`).join('');
+  const wet = data.climate.wet_months.length ? data.climate.wet_months.join(', ') : '–';
+
+  const crops = data.ranking.map(r => {
+    const alts = r.planting.alternatives.map(a =>
+      `<div style="font-size:12px;">📅 Plant <b>${esc(a.plant_from)}</b> → harvest ~${esc(a.harvest_about)} · rain ~${esc(a.rain_mean_mm)} mm (dry year ${esc(a.rain_dry_year_mm)}) · longest dry spell ~${esc(a.longest_dry_spell_days_avg)} d · below-optimum rain in ${esc(a.years_below_optimum_rain)} yrs</div>`).join('');
+    const recs = r.recommendations.map(x => `<div style="font-size:12px; margin-top:3px;">• ${esc(x.advice)}</div>`).join('');
+    return `<details style="border:1px solid var(--border); border-radius:8px; padding:6px 8px; margin-top:6px;">
+      <summary style="cursor:pointer; font-size:13px;">
+        <span style="background:${CLASS_COLOR[r.class]}; color:#fff; border-radius:4px; padding:1px 6px; font-size:11px; font-weight:700;">${esc(r.class)}</span>
+        <b>${esc(r.label)}</b> · index ${esc(r.index)}
+        ${r.limiting_factor.significant ? `<span style="color:#5c6b62; font-size:11px;">· limit: ${esc(r.limiting_factor.label)}</span>` : '<span style="color:#5c6b62; font-size:11px;">· no major limits</span>'}
+      </summary>
+      <div style="margin-top:6px;">${alts || '<div class="hint">No planting window could be scored.</div>'}</div>
+      <div class="table-wrap" style="margin-top:6px;"><table class="data-table"><thead><tr><th>Factor</th><th>Value</th><th>Score</th></tr></thead><tbody>${suitFactorRows(r.factors)}</tbody></table></div>
+      ${recs ? `<div style="margin-top:6px;"><b style="font-size:12px;">What to do about it</b>${recs}</div>` : ''}
+    </details>`;
+  }).join('');
+
+  box.innerHTML = `
+    <div style="font-size:13px;"><b>Soil (0–30 cm):</b> ${soilLine}</div>
+    <div style="margin:4px 0 8px;">${interp}</div>
+    <div style="font-size:13px;"><b>Climate:</b> ${esc(data.climate.annual_rain_mm)} mm/yr, ${esc(data.climate.mean_temp_c)} °C mean · wet months: ${esc(wet)} <span style="color:#5c6b62;">(${esc(data.climate.years)})</span></div>
+    <div style="font-size:13px; font-weight:600; margin-top:10px;">Crop ranking <span style="font-weight:400; color:#5c6b62;">(S1 high · S2 moderate · S3 marginal · N not suitable)</span></div>
+    ${crops}
+    <div class="hint" style="margin-top:8px;">${data.caveats.map(esc).join(' ')}</div>`;
+}
+
+document.getElementById('btn-suitability').onclick = async () => {
+  if (!currentBoundaryId) { showStatus('suit-status', 'Import or draw a farm boundary first.', 'error'); return; }
+  showStatus('suit-status', 'Reading soil and fetching 10 years of weather…', 'info');
+  const form = new FormData();
+  form.append('boundary_id', currentBoundaryId);
+  form.append('planting_date', document.getElementById('suit-planting').value.trim());
+  try {
+    const res = await fetch(`${API_BASE}/suitability/analyze`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    renderSuitability(await res.json());
+    document.getElementById('suit-status').className = 'status-msg';
+  } catch (err) { showStatus('suit-status', `Error: ${err.message}`, 'error'); }
+};
+
+document.getElementById('btn-forecast').onclick = async () => {
+  if (!currentBoundaryId) { showStatus('suit-status', 'Import or draw a farm boundary first.', 'error'); return; }
+  showStatus('suit-status', 'Fetching forecast…', 'info');
+  try {
+    const res = await fetch(`${API_BASE}/weather/forecast?boundary_id=${currentBoundaryId}&days=7`);
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const f = await res.json();
+    const adv = f.advisories.length ? f.advisories.map(a => `<div style="font-size:12px; margin-top:3px;">⚠ ${esc(a)}</div>`).join('')
+                                    : '<div class="hint">No weather flags for the next days.</div>';
+    const box = document.getElementById('suit-box');
+    box.style.display = 'block';
+    box.innerHTML = `<div style="font-size:13px;"><b>Next ${f.dates.length} days:</b> ${esc(f.total_rain_mm)} mm rain over ${esc(f.rainy_days)} wet day(s), max ${esc(f.max_temp_c)} °C</div>${adv}`;
+    document.getElementById('suit-status').className = 'status-msg';
+  } catch (err) { showStatus('suit-status', `Error: ${err.message}`, 'error'); }
+};
 </script>
 </body>
 </html>

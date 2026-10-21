@@ -22,6 +22,7 @@ variable-rate plan, drone plant counts, and share/collaborate exports.
 | Plant Health Maps & Prescriptions | `/api/imagery/process*` (6 indices) + `/api/zones/classify` | Satellite or drone |
 | Imagery Processing on Autopilot | `/api/imagery/search` (Sentinel-2 STAC) + `/api/drone/upload` | Satellite (auto) / drone (user stitches first) |
 | Share and Collaborate | `/api/annotations`, `/api/share`, `/api/export/*` | — |
+| Site suitability & planting plan | `/api/suitability/analyze`, `/api/soil/profile`, `/api/weather/climate`, `/api/weather/forecast` | HWSD v2.0 (local files) + Open-Meteo / NASA POWER (free APIs) |
 
 **Why two imagery paths?** Satellite (Sentinel-2, 10m/pixel, free, automatic,
 whole-farm) is great for field-level vegetation/water indices and management
@@ -31,6 +32,47 @@ consumes an already-stitched drone orthomosaic (output of Pix4D / Agisoft
 Metashape / DroneDeploy / OpenDroneMap) uploaded as a GeoTIFF — FarmScan
 doesn't do the raw-photo stitching itself, matching how Solvi also expects
 processed imagery at that stage.
+
+## Site suitability: soil + weather -> crop decisions
+
+```
+boundary ──┬─→ HWSD v2.0 raster (local, ~1 km)  → soil mapping units under the farm
+           │       → HWSD2_LAYERS (SQLite): sand/silt/clay, pH, organic C, CEC, EC, drainage ...
+           │       → share- and depth-weighted topsoil (0-30 cm) / subsoil (30-100 cm)
+           │
+           ├─→ Open-Meteo ERA5 archive (fallback NASA POWER), 10 yrs daily, cached in SQLite
+           │       → monthly normals, rainy season, per-year rain / temperature / dry spells
+           │
+           └─→ suitability.py + crop_requirements.json
+                   → per-factor 0-1 scores → class by most limiting factor (S1/S2/S3/N)
+                   → best planting windows (rain onset, cycle rain, dry spells, heat)
+                   → "what limits it" + management advice
+```
+
+**HWSD is not a web API** -- FAO distributes it as files. FarmScan hosts them locally (offline,
+no rate limits). One-time setup:
+
+1. Download the HWSD v2.0 raster and database from the FAO soils portal (see the header of
+   `backend/scripts/build_hwsd_sqlite.py` for the link).
+2. Put `HWSD2.bil` (+ `.hdr`/`.prj`) in `backend/data/hwsd/`.
+3. `python backend/scripts/build_hwsd_sqlite.py --mdb /path/to/HWSD2.mdb`
+   (or `--layers-csv` for a CSV export of the `HWSD2_LAYERS` table).
+4. `GET /api/data-status` should report `"ready": true`.
+
+Environment: `HWSD2_RASTER`, `HWSD2_DB` (override paths), `OPEN_METEO_API_KEY` +
+`OPEN_METEO_BASE_URL` (needed for **commercial** use of Open-Meteo; the free tier is
+non-commercial), `CROP_REQUIREMENTS` (path to your own crop table).
+
+**Read this before trusting a score**
+- HWSD pixels are ~1 km (~100 ha). A normal farm falls inside one pixel, so you get the *regional
+  soil association*, not your field. Use it to screen crops and plan; use a **lab soil test** for
+  fertilizer and lime rates. Plots inside one farm will not differ in soil data.
+- Reanalysis weather is ~9-25 km. Rainfall in particular is patchy; a local gauge beats it.
+- `crop_requirements.json` holds starter thresholds from general FAO/EcoCrop-style literature.
+  **Calibrate them with a local agronomist** (edit the file; no code change) before relying on
+  rankings. Scores assume rainfed production.
+- Satellite NDVI (the rest of FarmScan) is the reality check: if a field the model calls S1 shows
+  persistent low NDVI, something not in this data (compaction, pests, management) is limiting it.
 
 ## How it works
 

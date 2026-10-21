@@ -27,6 +27,9 @@ import drone_ingest
 import annotations as annotations_mod
 import plot_import as plot_import_mod
 import monitoring as monitoring_mod
+import soil as soil_mod
+import weather as weather_mod
+import suitability as suitability_mod
 
 DB_PATH = Path(os.environ.get("FARMSCAN_DB", Path(__file__).parent / "farmscan.db"))
 UPLOAD_DIR = Path(__file__).parent / "uploads"
@@ -984,6 +987,93 @@ async def resolve_share(token: str):
             result["stats"] = cached["stats"]
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Site suitability: soil (HWSD v2.0, local) + weather (Open-Meteo / NASA POWER)
+# These handlers are plain `def` (not async) on purpose: they make blocking HTTP
+# and raster calls, so FastAPI runs them in its threadpool instead of stalling
+# the event loop.
+# ---------------------------------------------------------------------------
+
+def _boundary_geometry(boundary_id: str):
+    """(geojson geometry, centroid lat, centroid lon) for a saved boundary."""
+    conn = get_db()
+    row = conn.execute("SELECT geojson FROM boundaries WHERE id = ?", (boundary_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(404, "Boundary not found")
+    geometry = json.loads(row["geojson"])
+    c = shape(geometry).centroid
+    return geometry, c.y, c.x
+
+
+def _soil_or_http_error(geometry: dict) -> dict:
+    try:
+        return soil_mod.soil_profile(geometry)
+    except soil_mod.SoilDataUnavailable as e:
+        raise HTTPException(503, str(e))
+
+
+def _weather_or_http_error(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except weather_mod.WeatherUnavailable as e:
+        raise HTTPException(502, str(e))
+
+
+@app.get("/api/data-status")
+def data_status():
+    """Is the soil dataset installed? Which weather providers are configured?"""
+    return {"soil": soil_mod.status(),
+            "weather": {"primary": "Open-Meteo (ERA5 + forecast)", "fallback": "NASA POWER",
+                        "commercial_key_configured": bool(weather_mod.OPEN_METEO_KEY)}}
+
+
+@app.get("/api/soil/profile")
+def soil_profile(boundary_id: str):
+    """Soil constituents under the boundary (sand/silt/clay, pH, organic carbon, CEC, salinity,
+    drainage, ...) by depth, from HWSD v2.0 (~1 km). Screening-grade: confirm with a soil test."""
+    geometry, _, _ = _boundary_geometry(boundary_id)
+    return {"boundary_id": boundary_id, **_soil_or_http_error(geometry)}
+
+
+@app.get("/api/weather/climate")
+def weather_climate(boundary_id: str, years: int = 10):
+    """Monthly rainfall/temperature normals + rainy season from the last `years` full years."""
+    _, lat, lon = _boundary_geometry(boundary_id)
+    series = _weather_or_http_error(weather_mod.get_daily_history, lat, lon, years)
+    return {"boundary_id": boundary_id, "lat": lat, "lon": lon, **weather_mod.climate_summary(series)}
+
+
+@app.get("/api/weather/forecast")
+def weather_forecast(boundary_id: str, days: int = 7):
+    _, lat, lon = _boundary_geometry(boundary_id)
+    return {"boundary_id": boundary_id, "lat": lat, "lon": lon,
+            **_weather_or_http_error(weather_mod.get_forecast, lat, lon, days)}
+
+
+@app.get("/api/suitability/crops")
+def suitability_crops():
+    return [{"id": cid, "label": c["label"], "cycle_days": c["cycle_days"]}
+            for cid, c in suitability_mod.load_crops().items()]
+
+
+@app.post("/api/suitability/analyze")
+def suitability_analyze(boundary_id: str = Form(...), crops: str = Form(""),
+                        planting_date: str = Form(""), years: int = Form(10)):
+    """Ranks crops for the farm: soil + climate scoring, the limiting factor for each,
+    the best planting windows, and management advice. `crops` is a comma-separated list
+    (blank = all); `planting_date` is YYYY-MM-DD or MM-DD (blank = search the best window)."""
+    geometry, lat, lon = _boundary_geometry(boundary_id)
+    profile = _soil_or_http_error(geometry)
+    series = _weather_or_http_error(weather_mod.get_daily_history, lat, lon, years)
+    crop_ids = [c.strip().lower() for c in crops.split(",") if c.strip()] or None
+    try:
+        result = suitability_mod.analyze(profile, series, crop_ids, planting_date or None, lat=lat, lon=lon)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"boundary_id": boundary_id, **result}
 
 
 @app.get("/api/health")
