@@ -119,6 +119,19 @@ FarmScan is one of the GeoEstate products. It has no accounts of its own:
   timeline, notes, share links. Nothing is lost when the service redeploys.
 - **Files** (drone orthomosaics, the soil dataset) live in the platform bucket under `farm/`.
 
+### Many farms, field teams and scouts (with Geohub)
+
+- **All farms**: every farm of the organization on one map, coloured by its latest NDVI and ranked weakest first
+  (dropping since the previous image first), with open scouting tasks (`GET /api/portfolio`).
+- **Farms from the field**: a field team walks each farm's boundary with a Geohub form started from the **Farm
+  enumeration** template (farmer, phone, community, crops, planting date, tenure, water). "From Geohub" brings every
+  submitted or approved record in as a farm with its farmer's details; run it again as more come in
+  (`POST /api/enumeration/import`). The plan's hectares apply.
+- **Scouting**: a manager picks the organization's Geohub form started from the **Farm scouting** template once.
+  "Send problem areas to scouts" makes one task per problem area, each a link that opens that form in the Geohub
+  collector with the farm, the task and what the satellite saw filled in and the place marked; share them on WhatsApp.
+  "Check scouts' answers" reads the records back by task and shows the cause, severity and photos count per area.
+
 ### Deploying (Railway)
 
 The service is `backend/` (Railpack, `uvicorn main:app`), which also serves the web app. Variables:
