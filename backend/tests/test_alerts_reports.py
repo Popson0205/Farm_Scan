@@ -214,3 +214,15 @@ def test_farm_report_pdf_renders_every_section():
     for c in (full, dict(base, kind="farm", title="not_in_plan"), dict(base, title=None)):   # the last is an old report
         pdf = reports.build_pdf(c)
         assert pdf[:4] == b"%PDF" and len(pdf) > 2500
+
+
+def test_title_status_tells_a_missing_key_from_a_stopped_service(monkeypatch):
+    import httpx
+    import reports
+    monkeypatch.setenv("LAND_API", "https://land.example/api"); monkeypatch.setenv("LAND_PLATFORM_KEY", "k" * 40)
+    answers = {"body": None}
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(503, **answers["body"]))
+    answers["body"] = {"json": {"status": 503, "code": "not_configured", "detail": "not set up"}}
+    assert "no PLATFORM_KEY set" in reports.title_status(9.0, 7.5)["reason"]
+    answers["body"] = {"text": "<html>Application not available</html>"}       # Railway, not Land Registry
+    assert "not running" in reports.title_status(9.0, 7.5)["reason"]
