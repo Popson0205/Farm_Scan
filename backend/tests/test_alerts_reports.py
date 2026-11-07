@@ -121,3 +121,25 @@ def test_report_content_reads_the_season(mocked):
     import reports
     rf = reports.rainfall(weather.get_daily_history(0, 0), {"wet_months": [4, 5]})
     assert rf["normal_mm"] > 800 and len(rf["years"]) == 3 and rf["years"][-1]["year"] == 2025 and rf["years"][-1]["vs_normal_pct"] == 0
+
+
+def test_brevo_is_used_like_geohub(monkeypatch):
+    """With BREVO_API_KEY set (as on Geohub), the alert email goes through Brevo's API, from MAIL_FROM, replies to MAIL_REPLY_TO."""
+    for k in ("MAIL_TEST_OUTBOX", "RESEND_API_KEY", "SMTP_HOST"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("BREVO_API_KEY", "xkeysib-test")
+    monkeypatch.setenv("MAIL_FROM", "GeoEstate <no-reply@geoestate.ng>")
+    monkeypatch.setenv("MAIL_REPLY_TO", "support@geoestate.ng")
+    sent = []
+
+    class R:
+        status_code = 201
+        text = "{}"
+
+    monkeypatch.setattr(mailer.httpx, "post", lambda url, json, headers, timeout: sent.append((url, json, headers)) or R())
+    assert mailer.backend() == "brevo" and mailer.configured()
+    mailer.send("ada@example.com", "FarmScan: 1 farm to check", "Dry spell")
+    url, body, headers = sent[0]
+    assert url == "https://api.brevo.com/v3/smtp/email" and headers["api-key"] == "xkeysib-test"
+    assert body["sender"] == {"name": "GeoEstate", "email": "no-reply@geoestate.ng"} and body["to"] == [{"email": "ada@example.com"}]
+    assert body["replyTo"] == {"email": "support@geoestate.ng"} and body["textContent"] == "Dry spell"

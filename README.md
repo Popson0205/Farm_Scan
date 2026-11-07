@@ -122,7 +122,7 @@ FarmScan is one of the GeoEstate products. It has no accounts of its own:
   satellite fire detections on or within 500 m of the farm in the last 7 days (NASA FIRMS, needs `FIRMS_MAP_KEY`, free
   at firms.modaps.eosdis.nasa.gov/api/map_key), and crop drops in the farm's timeline in the last 21 days. People who
   ask for them get them by email once a week (an hourly check in the service; one email per organization per week,
-  only while its licence includes alerts and is current). Email goes through `RESEND_API_KEY` or `SMTP_*`, from
+  only while its licence includes alerts and is current). Email goes through `BREVO_API_KEY` (or `RESEND_API_KEY`, `SMTP_*`), from
   `MAIL_FROM` — the same as Geohub's.
 - **Verification report** (`POST /api/reports/verification`, plan feature `verification`): a numbered PDF with the
   farm's measured (and declared) area and outline, its crop seasons from the timeline (last three years), rainfall
@@ -143,7 +143,7 @@ The service is `backend/` (Railpack, `uvicorn main:app`), which also serves the 
 | `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET`, `S3_REGION` | the platform bucket (same as Geohub's) |
 | `DEMO_TOOLS` | leave unset; `true` only on a demonstration copy (shows "practice with sample data") |
 | `OPEN_METEO_API_KEY` | optional: Open-Meteo's commercial key |
-| `RESEND_API_KEY` or `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASSWORD`, `MAIL_FROM`, `MAIL_REPLY_TO` | weekly alert emails: copy Geohub's values (the same email service) |
+| `BREVO_API_KEY` (or `RESEND_API_KEY`, or `SMTP_*`), `MAIL_FROM`, `MAIL_REPLY_TO` | weekly alert emails: copy Geohub's values (the same email service) |
 | `FIRMS_MAP_KEY` | optional: NASA FIRMS key for fire alerts |
 | `LAND_API`, `LAND_PLATFORM_KEY` | optional: title status in verification reports (Land Registry's `PLATFORM_KEY`) |
 
