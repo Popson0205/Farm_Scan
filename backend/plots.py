@@ -6,6 +6,8 @@ added, deleted, or replaced by an imported SHP/KML layer (see plot_import.py).
 import numpy as np
 from shapely.geometry import box, shape, mapping
 
+import geo
+
 
 def generate_grid_plots(boundary_geojson: dict, rows: int, cols: int,
                          row_gap_m: float = 0.0, col_gap_m: float = 0.0) -> list[dict]:
@@ -45,8 +47,7 @@ def generate_grid_plots(boundary_geojson: dict, rows: int, cols: int,
             if clipped.is_empty or clipped.area <= 0:
                 continue
 
-            # area in m^2 via the same local approximation
-            area_m2 = clipped.area * m_per_deg_lat * m_per_deg_lon
+            area_m2 = geo.area_m2(clipped)          # on the ellipsoid
 
             plots.append({
                 "plot_id": plot_id,

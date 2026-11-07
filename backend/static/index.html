@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FarmScan — Open Satellite Farm Monitoring</title>
+<title>FarmScan · GeoEstate</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css" />
 <style>
@@ -38,6 +38,33 @@
   }
   #topbar h1 { font-size: 17px; margin: 0; font-weight: 700; letter-spacing: -0.01em; }
   #topbar p { font-size: 12px; margin: 0; opacity: 0.85; }
+  #topbar { align-items: center; }
+  #account { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 12.5px; position: relative; }
+  #account .org { opacity: .9; }
+  #account .pill { background: rgba(255,255,255,.16); border-radius: 999px; padding: 3px 10px; white-space: nowrap; }
+  #account button { background: rgba(255,255,255,.14); color: #fff; border: 1px solid rgba(255,255,255,.3); border-radius: 7px;
+    padding: 5px 10px; font: inherit; cursor: pointer; }
+  #account button:hover { background: rgba(255,255,255,.24); }
+  #apps-menu { position: absolute; right: 0; top: calc(100% + 8px); background: #fff; color: var(--ink); border: 1px solid var(--border);
+    border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.18); min-width: 260px; padding: 6px; z-index: 2000; display: none; }
+  #apps-menu.open { display: block; }
+  #apps-menu a, #apps-menu .here, #apps-menu .off { display: block; padding: 9px 10px; border-radius: 7px; color: var(--ink); text-decoration: none; }
+  #apps-menu a:hover { background: var(--green-100); }
+  #apps-menu strong { display: block; font-size: 13px; }
+  #apps-menu span { font-size: 11.5px; color: var(--muted); }
+  #apps-menu .off { opacity: .55; }
+  #apps-menu .menu-sep { border-top: 1px solid var(--border); margin: 6px 0; }
+  #licence-banner { display: none; padding: 8px 22px; font-size: 12.5px; background: #fff4d6; color: #6b4e00; border-bottom: 1px solid #f0dca0; }
+  #licence-banner.bad { background: #fde7e2; color: #8a2b16; border-color: #f2c2b6; }
+  #signin { position: fixed; inset: 0; z-index: 3000; display: none; align-items: center; justify-content: center;
+    background: linear-gradient(135deg, var(--green-900), var(--green-700)); color: #fff; padding: 16px; }
+  #signin .card { background: #fff; color: var(--ink); border-radius: 14px; padding: 28px; max-width: 420px; width: 100%; box-shadow: 0 20px 60px rgba(0,0,0,.25); }
+  #signin h2 { margin: 0 0 6px; font-size: 20px; color: var(--green-900); }
+  #signin p { margin: 0 0 16px; color: var(--muted); font-size: 14px; line-height: 1.5; }
+  #signin .err { color: var(--danger); font-size: 13px; }
+  .section.locked > *:not(h2):not(.plan-note) { opacity: .45; pointer-events: none; }
+  .plan-note { font-size: 12px; color: #6b4e00; background: #fff4d6; border-radius: 7px; padding: 7px 10px; margin: 0 0 10px; }
+  .sample-note { font-size: 12px; color: #8a2b16; background: #fde7e2; border-radius: 7px; padding: 7px 10px; margin: 8px 0 0; }
 
   #body { flex: 1; display: flex; min-height: 0; }
 
@@ -153,6 +180,16 @@
   <div id="topbar">
     <h1>🌾 FarmScan</h1>
     <p>Vegetation health (left) · Plots, plant counts &amp; statistics (right)</p>
+    <div id="account"></div>
+  </div>
+  <div id="licence-banner" role="status"></div>
+  <div id="signin" role="dialog" aria-labelledby="signin-title">
+    <div class="card">
+      <h2 id="signin-title">FarmScan</h2>
+      <p>Satellite crop monitoring, management zones, drone plant counts and crop suitability for your farms. Sign in with your GeoEstate account (Geohub) to continue.</p>
+      <p class="err" id="signin-error"></p>
+      <a class="btn btn-primary" id="signin-btn" href="/api/auth/sign-in?next=/" style="display:block; text-align:center; text-decoration:none;">Sign in with GeoEstate</a>
+    </div>
   </div>
 
   <div id="body">
@@ -170,7 +207,7 @@
       <div class="status-msg" id="boundary-status"></div>
     </div>
 
-    <div class="section">
+    <div class="section" data-feature="monitoring">
       <h2>2 · Imagery Date Range</h2>
       <label>From</label>
       <input type="date" id="date-start">
@@ -181,7 +218,7 @@
       <div class="btn-row">
         <button class="btn btn-secondary" id="btn-search-live">🛰️ Search live scenes</button>
       </div>
-      <div class="hint">Live search queries Sentinel-2 via Microsoft Planetary Computer (needs the backend to have outbound internet access). Use Demo Mode below if you're running this offline / in a sandboxed environment.</div>
+      <div class="hint">Searches Sentinel-2 (10 m, every 5 days) through Microsoft Planetary Computer and keeps the clearest scenes that cover the whole farm. In the rainy season clouds can hide a farm for weeks: widen the dates or raise the cloud limit.</div>
       <div class="status-msg" id="search-status"></div>
       <div id="scene-list" style="margin-top:8px;"></div>
     </div>
@@ -191,11 +228,12 @@
       <div class="index-grid" id="index-grid"></div>
     </div>
 
-    <div class="section">
-      <div class="btn-row">
-        <button class="btn btn-primary" id="btn-process-demo">▶ Run (Demo data)</button>
+    <div class="section" data-feature="monitoring">
+      <button class="btn btn-primary" id="btn-process-live" disabled>▶ Run on the selected scene</button>
+      <div class="demo-only" style="display:none;">
+        <button class="btn btn-secondary" id="btn-process-demo" style="margin-top:8px;">🧪 Practice with sample data</button>
+        <div class="sample-note">Sample data is made up, not your farm: for demonstrations only.</div>
       </div>
-      <button class="btn btn-secondary" id="btn-process-live" style="margin-top:8px;" disabled>▶ Run on selected live scene</button>
       <div class="status-msg" id="process-status"></div>
     </div>
 
@@ -222,11 +260,11 @@
       </div>
     </div>
 
-    <div class="section">
+    <div class="section" data-feature="monitoring">
       <h2>Field Monitoring</h2>
       <div class="hint" style="margin:0 0 10px;">Turns images into action: how the field is changing across the season, and where to walk first.</div>
       <button class="btn btn-secondary" id="btn-timeline">📈 Season timeline &amp; alerts</button>
-      <button class="btn btn-secondary" id="btn-demo-season" style="margin-top:8px;">🧪 Add demo season (4 dates, demo mode only)</button>
+      <button class="btn btn-secondary demo-only" id="btn-demo-season" style="margin-top:8px; display:none;">🧪 Practice: add a sample season (4 made-up dates)</button>
       <div id="timeline-box" style="display:none; margin-top:10px;"></div>
 
       <div style="margin-top:16px;">
@@ -245,7 +283,7 @@
       <div class="status-msg" id="monitor-status"></div>
     </div>
 
-    <div class="section">
+    <div class="section" data-feature="suitability">
       <h2>Site Suitability</h2>
       <div class="hint" style="margin:0 0 10px;">Soil (FAO HWSD) + weather history (Open-Meteo) &rarr; which crops fit this farm, when to plant, and what limits them. Screening-grade: confirm with a soil test.</div>
       <label>Planting date <span style="font-weight:400; color:#5c6b62;">(optional &mdash; blank = find the best window)</span></label>
@@ -278,7 +316,7 @@
   <div id="sidebar-right" class="sidebar">
     <div class="sidebar-title">Plots &amp; Field Data<span class="sub">Drone imagery, plant counts, plot editing &amp; per-plot data</span></div>
 
-    <div class="section">
+    <div class="section" data-feature="drone">
       <h2>Drone Orthomosaic</h2>
       <div class="hint" style="margin-bottom:8px;">Needs a cm-resolution drone orthomosaic (Pix4D/Agisoft/ODM output) — satellite imagery is too coarse to resolve individual plants or plots.</div>
       <input type="file" id="drone-file-input" accept=".tif,.tiff" style="margin-bottom:8px;">
@@ -290,7 +328,7 @@
       </div>
     </div>
 
-    <div class="section">
+    <div class="section" data-feature="plant_count">
       <h2>Plant Counts</h2>
       <button class="btn btn-secondary" id="btn-plant-count" disabled>🌱 Count plants (field-wide)</button>
       <button class="btn btn-secondary" id="btn-plant-count-per-plot" style="margin-top:8px;" disabled>🌱 Count plants per plot</button>
@@ -323,10 +361,10 @@
         <label>Import plots</label>
         <input type="file" id="plots-import-input" accept=".zip,.kml" style="margin-bottom:8px;">
         <button class="btn btn-secondary" id="btn-import-plots">⬆ Import SHP (.zip) or KML</button>
-        <div class="hint">Already digitized plots elsewhere (QGIS, a trial-management tool)? Import them directly instead of generating or auto-detecting.</div>
+        <div class="hint">Already digitized plots elsewhere (QGIS, a trial-management tool)? Import them directly instead of generating a grid or drawing them.</div>
       </div>
 
-      <div style="margin-top:14px;">
+      <div style="margin-top:14px;" data-feature="zones" class="section-part">
         <label>Management zones</label>
         <div style="display:flex; gap:8px;">
           <select id="n-zones" style="margin-bottom:8px;">
@@ -336,6 +374,7 @@
           <button class="btn btn-secondary" id="btn-classify-zones" style="margin-bottom:8px;">Classify</button>
         </div>
         <div class="hint">Clusters the current index into low/medium/high zones — the basis for a variable-rate prescription file.</div>
+        <div data-feature="prescriptions" class="section-part">
         <div class="hint" style="margin-bottom:8px;">Optional — add your flat-rate recommendation to get a rate plan per zone:</div>
         <div style="display:flex; gap:8px;">
           <input type="number" id="zone-base-rate" placeholder="Base rate (e.g. 90)" min="0" step="any" style="margin-bottom:8px;">
@@ -350,6 +389,7 @@
           <option value="0.2" selected>Vary rate ±20%</option>
           <option value="0.3">Vary rate ±30%</option>
         </select>
+        </div>
         <div id="zone-plan-box" style="display:none;"></div>
       </div>
     </div>
@@ -409,10 +449,15 @@ const API_BASE = "/api";
 
 // ---------------- Map setup ----------------
 const map = L.map('map').setView([9.0765, 7.3986], 12); // default: Abuja, Nigeria
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  maxZoom: 19,
-  attribution: '&copy; OpenStreetMap contributors'
-}).addTo(map);
+// Esri basemaps (no key needed); satellite first, as farms are judged by eye on imagery
+const BASEMAPS = {
+  'Satellite': L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 19, attribution: 'Imagery &copy; Esri, Maxar, Earthstar Geographics' }),
+  'Map': L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 19, attribution: '&copy; Esri, HERE, Garmin, OpenStreetMap contributors' }),
+};
+BASEMAPS['Satellite'].addTo(map);
+L.control.layers(BASEMAPS, null, { position: 'topright' }).addTo(map);
 
 const drawnItems = new L.FeatureGroup();
 map.addLayer(drawnItems);
@@ -511,7 +556,8 @@ async function saveBoundary(name, geometry) {
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
     const data = await res.json();
     currentBoundaryId = data.boundary_id;
-    currentBoundaries.push({ id: data.boundary_id, name, area_ha: data.area_ha, geojson: geometry });
+    currentBoundaries.unshift({ id: data.boundary_id, name, area_ha: data.area_ha, geojson: geometry });
+    if (ME) { ME.hectares_used = Math.round((ME.hectares_used + data.area_ha) * 100) / 100; renderAccount(); }
     renderFarmList();
     drawGeoJSONOnMap(geometry);
     map.fitBounds([[data.bounds[1], data.bounds[0]], [data.bounds[3], data.bounds[2]]]);
@@ -534,16 +580,55 @@ function renderFarmList() {
   currentBoundaries.forEach(f => {
     const div = document.createElement('div');
     div.className = 'farm-item' + (f.id === currentBoundaryId ? ' active' : '');
-    div.innerHTML = `<span>${f.name}</span><span class="area">${f.area_ha} ha</span>`;
-    div.onclick = () => {
-      currentBoundaryId = f.id;
-      drawGeoJSONOnMap(f.geojson);
-      const b = L.geoJSON(f.geojson).getBounds();
-      map.fitBounds(b);
-      renderFarmList();
-    };
+    div.innerHTML = `<span>${esc(f.name)}</span><span class="area">${f.area_ha} ha</span>`;
+    div.onclick = () => openFarm(f.id);
+    if (ME && ME.role === 'manager' && ME.can_write) {
+      const x = document.createElement('button');
+      x.className = 'farm-remove'; x.title = 'Remove this farm'; x.textContent = '✕';
+      x.style.cssText = 'margin-left:8px; border:0; background:none; color:#8a2b16; cursor:pointer; font-size:13px;';
+      x.onclick = async (e) => {
+        e.stopPropagation();
+        if (!confirm(`Remove "${f.name}" with its plots, timeline and notes? This cannot be undone.`)) return;
+        const res = await fetch(`${API_BASE}/boundary/${f.id}`, { method: 'DELETE' });
+        if (!res.ok) { showStatus('boundary-status', (await res.json()).detail || 'Could not remove it.', 'error'); return; }
+        currentBoundaries = currentBoundaries.filter(b => b.id !== f.id);
+        ME.hectares_used = Math.max(0, Math.round((ME.hectares_used - f.area_ha) * 100) / 100); renderAccount();
+        if (currentBoundaryId === f.id) { currentBoundaryId = null; drawnItems.clearLayers(); if (overlayLayer) { map.removeLayer(overlayLayer); overlayLayer = null; } }
+        renderFarmList();
+      };
+      div.appendChild(x);
+    }
     list.appendChild(div);
   });
+}
+
+// Open one of the organization's farms: its boundary, plots and notes.
+async function openFarm(id) {
+  try {
+    const res = await fetch(`${API_BASE}/boundary/${id}`);
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const f = await res.json();
+    const known = currentBoundaries.find(x => x.id === id);
+    if (known) known.geojson = f.geojson;
+    currentBoundaryId = id;
+    drawGeoJSONOnMap(f.geojson);
+    map.fitBounds(L.geoJSON(f.geojson).getBounds());
+    renderFarmList();
+    if (overlayLayer) { map.removeLayer(overlayLayer); overlayLayer = null; }
+    const pr = await fetch(`${API_BASE}/plots/${id}`);
+    if (pr.ok) { const p = await pr.json(); if (typeof drawPlotsOnMap === 'function') drawPlotsOnMap(p.plots); }
+    if (typeof loadAnnotations === 'function') loadAnnotations();
+  } catch (err) {
+    showStatus('boundary-status', `Error: ${err.message}`, 'error');
+  }
+}
+
+async function loadFarms() {
+  const res = await fetch(`${API_BASE}/boundaries`);
+  if (!res.ok) return;
+  currentBoundaries = (await res.json()).map(f => ({ id: f.id, name: f.name, area_ha: f.area_ha, geojson: null }));
+  renderFarmList();
+  if (!currentBoundaries.length) showStatus('boundary-status', 'No farms yet: draw one on the map or upload a GeoJSON boundary.', 'info');
 }
 
 // ---------------- Live scene search ----------------
@@ -1370,6 +1455,108 @@ document.getElementById('btn-forecast').onclick = async () => {
     document.getElementById('suit-status').className = 'status-msg';
   } catch (err) { showStatus('suit-status', `Error: ${err.message}`, 'error'); }
 };
+
+// =====================================================================
+// GeoEstate account: sign-in, the plan, the app switcher
+// =====================================================================
+let ME = null;
+const _fetch = window.fetch.bind(window);
+window.fetch = async (...args) => {           // a sign-in that ended anywhere sends the person back to sign in
+  const res = await _fetch(...args);
+  const url = String(args[0] && args[0].url || args[0]);
+  if (res.status === 401 && url.includes('/api/') && !url.includes('/api/share/')) showSignIn();
+  return res;
+};
+
+function showSignIn(message) {
+  const here = window.location.pathname + window.location.search;
+  document.getElementById('signin-btn').href = `/api/auth/sign-in?next=${encodeURIComponent(here.replace(/[?&]signin_error=[^&]*/, '') || '/')}`;
+  document.getElementById('signin-error').textContent = message || '';
+  document.getElementById('signin').style.display = 'flex';
+}
+
+const PLAN_WORDS = { standard: 'Standard', advanced: 'Advanced', custom: 'Custom' };
+const FEATURE_WORDS = { monitoring: 'Satellite monitoring', zones: 'Management zones', suitability: 'Crop suitability',
+  drone: 'Drone imagery', plant_count: 'Plant counts', prescriptions: 'Variable-rate prescriptions' };
+const APP_WORDS = { hub: 'Field data, maps and dashboards', land: 'Parcels, titles and the land register',
+  check: 'Location reports', farm: 'Satellite farm monitoring' };
+
+function renderAccount() {
+  const ha = ME.hectares_limit != null ? `${ME.hectares_used.toLocaleString()} / ${Number(ME.hectares_limit).toLocaleString()} ha`
+                                       : `${ME.hectares_used.toLocaleString()} ha`;
+  const acct = document.getElementById('account');
+  acct.innerHTML = `<span class="org">${esc(ME.org_name || '')}</span>
+    <span class="pill" title="Hectares of farms on your plan">${esc(PLAN_WORDS[ME.plan] || ME.plan || '')} · ${ha}</span>
+    <button id="btn-apps" aria-haspopup="true" aria-expanded="false">Apps ▾</button>
+    <button id="btn-signout" title="${esc(ME.name)} (${esc(ME.email)})">Sign out</button>
+    <div id="apps-menu" role="menu"></div>`;
+  document.getElementById('btn-signout').onclick = async () => {
+    await _fetch(`${API_BASE}/auth/sign-out`, { method: 'POST' });
+    showSignIn('You are signed out of FarmScan.');
+  };
+  const btn = document.getElementById('btn-apps'), menu = document.getElementById('apps-menu');
+  btn.onclick = async (e) => {
+    e.stopPropagation();
+    const open = !menu.classList.contains('open');
+    menu.classList.toggle('open', open); btn.setAttribute('aria-expanded', String(open));
+    if (!open || menu.dataset.loaded) return;
+    const res = await fetch(`${API_BASE}/apps`);
+    const apps = res.ok ? await res.json() : [];
+    menu.innerHTML = apps.map(a => {
+      const body = `<strong>${esc(a.name)}</strong><span>${a.current ? 'You are here' : esc(APP_WORDS[a.product] || '')}</span>`;
+      if (a.current) return `<div class="here" role="menuitem" aria-current="page">${body}</div>`;
+      if (!a.url) return `<div class="off" role="menuitem" aria-disabled="true">${body}</div>`;
+      return `<a role="menuitem" href="${esc(a.url)}" target="_blank" rel="noopener">${body}</a>`;
+    }).join('') || '<div class="off">Geohub could not be reached.</div>';
+    menu.dataset.loaded = '1';
+  };
+  document.onclick = () => { menu.classList.remove('open'); btn.setAttribute('aria-expanded', 'false'); };
+
+  const banner = document.getElementById('licence-banner');
+  const words = {
+    demo: `${esc(ME.org_name)} is on a FarmScan demo${ME.ends_on ? ` until ${esc(ME.ends_on)}` : ''}.`,
+    grace: `${esc(ME.org_name)}'s FarmScan subscription has ended; it stays open for a short grace period. Renew with GeoEstate NIG Limited.`,
+    expired: `${esc(ME.org_name)}'s FarmScan subscription has ended, so FarmScan is read-only: you can view and export, but not add or run anything. Renew with GeoEstate NIG Limited.`,
+  };
+  if (words[ME.licence]) {
+    banner.innerHTML = words[ME.licence];
+    banner.className = ME.licence === 'expired' ? 'bad' : '';
+    banner.style.display = 'block';
+  }
+  if (ME.role === 'viewer') {
+    banner.innerHTML = (banner.innerHTML ? banner.innerHTML + ' ' : '') + 'You can view farms and results; adding or running anything needs a manager or agronomist in your organization.';
+    banner.style.display = 'block';
+  }
+}
+
+function applyPlan() {
+  document.querySelectorAll('[data-feature]').forEach(el => {
+    const f = el.dataset.feature;
+    if (ME.features.includes(f)) return;
+    el.classList.add('locked');
+    if (el.classList.contains('section-part')) { el.style.opacity = '.45'; el.style.pointerEvents = 'none'; }
+    const note = document.createElement('div');
+    note.className = 'plan-note';
+    note.textContent = `${FEATURE_WORDS[f] || f} is not in your FarmScan plan. Ask GeoEstate NIG Limited to add it.`;
+    const h = el.querySelector('h2');
+    if (h) h.after(note); else el.before(note);
+  });
+  document.querySelectorAll('.demo-only').forEach(el => { el.style.display = ME.demo_tools ? '' : 'none'; });
+}
+
+(async function start() {
+  const q = new URLSearchParams(window.location.search);
+  const res = await _fetch(`${API_BASE}/me`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    showSignIn(q.get('signin_error') || (res.status === 401 ? '' : body.detail));
+    return;
+  }
+  ME = await res.json();
+  renderAccount();
+  applyPlan();
+  await loadFarms();
+})();
 </script>
 </body>
 </html>

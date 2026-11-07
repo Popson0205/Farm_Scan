@@ -105,34 +105,51 @@ Collaborate: point annotations, shareable read-only links
 **Frontend**: Plain HTML/JS + Leaflet + Leaflet.draw (no build step needed)
 **Imagery source**: [Microsoft Planetary Computer](https://planetarycomputer.microsoft.com/) — free Sentinel-2 L2A STAC catalog, no API key required.
 
-## Running it
+## On the GeoEstate platform
 
-### 1. Backend
+FarmScan is one of the GeoEstate products. It has no accounts of its own:
+
+- **Sign-in** is GeoEstate ID (Geohub). People open FarmScan, sign in with their GeoEstate account, and work in their
+  organization. Roles come from their Geohub role: owner/admin = **manager**, member = **agronomist**,
+  collector/viewer (and GeoEstate staff) = **viewer** (read only).
+- **The licence** is the organization's FarmScan entitlement in Geohub (sold and invoiced in the CRM). Its plan switches
+  features on (Standard: monitoring, zones, suitability; Advanced adds drone, plant counts, prescriptions) and sets the
+  **hectares** of farms the organization can monitor. Expired = read-only, suspended = closed.
+- **Data** lives in the platform database (PostgreSQL + PostGIS), in the `farm` schema: farms, plots, the season
+  timeline, notes, share links. Nothing is lost when the service redeploys.
+- **Files** (drone orthomosaics, the soil dataset) live in the platform bucket under `farm/`.
+
+### Deploying (Railway)
+
+The service is `backend/` (Railpack, `uvicorn main:app`), which also serves the web app. Variables:
+
+| Variable | Value |
+|---|---|
+| `DATABASE_URL` | the platform database (Geohub's) |
+| `APP_URL` | FarmScan's own address, e.g. `https://farm.geoestate.ng` |
+| `GEOHUB_URL` / `GEOHUB_API` | Geohub's address and its API (`…/api`) |
+| `ID_SECRET` | the secret Geohub's `ID_CLIENTS` lists for `farm` |
+| `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET`, `S3_REGION` | the platform bucket (same as Geohub's) |
+| `DEMO_TOOLS` | leave unset; `true` only on a demonstration copy (shows "practice with sample data") |
+| `OPEN_METEO_API_KEY` | optional: Open-Meteo's commercial key |
+
+In Geohub: add `{"id": "farm", "redirect_uris": ["<APP_URL>/api/auth/callback"], "secret": "<ID_SECRET>"}` to
+`ID_CLIENTS`, and `farm=<APP_URL>` to `PRODUCT_URLS` (the app switcher).
+
+**Soil data:** upload `HWSD2.bil`, `HWSD2.hdr`, `HWSD2.prj` and `hwsd2.sqlite` once to the bucket under
+`farm/data/hwsd/` (build the sqlite with `backend/scripts/build_hwsd_sqlite.py`). FarmScan fetches them at start-up.
+
+### Running it locally
 
 ```bash
 cd backend
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
+pip install -r requirements-dev.txt
+DATABASE_URL=postgresql://… GEOHUB_URL=… GEOHUB_API=… ID_SECRET=… uvicorn main:app --reload --port 8000
 ```
 
-Live satellite search/processing needs outbound access to
-`planetarycomputer.microsoft.com`. Without that (e.g. a sandboxed dev
-environment), use the demo endpoints (`process-demo`) — they generate
-spatially-realistic synthetic reflectance data so the entire pipeline
-(boundary → index → plots → zones → exports) can be tested offline. All of
-this was verified working end-to-end in demo mode during development,
-including every export format and the plant counter (55/60 = 92% detected on
-a synthetic test image with well-separated blobs).
-
-### 2. Frontend
-
-```bash
-cd frontend
-python3 -m http.server 5500
-```
-
-Visit `http://localhost:5500`. Talks to the backend at `http://127.0.0.1:8000`
-(edit `API_BASE` in `index.html` if deployed elsewhere).
+Live satellite search/processing needs outbound access to `planetarycomputer.microsoft.com`. With `DEMO_TOOLS=true`,
+synthetic sample data exercises the whole pipeline offline; it is labelled as sample data and kept apart from real
+images in the timeline.
 
 ## API reference
 
@@ -258,14 +275,14 @@ These change the numbers, so re-run any saved results:
 
 ```bash
 cd backend
-pip install -r requirements.txt pytest httpx
+pip install -r requirements-dev.txt
 python3 -m pytest
 ```
 
 Covers problem-area detection, trend alerts, plot ranking, rate-plan maths, STAC band
-handling (offset, cloud mask, mixed resolution), and the full demo-mode API flow.
-Tests use an isolated database via the `FARMSCAN_DB` environment variable, which you
-can also use in deployment to point the SQLite file at a persistent volume.
+handling (offset, cloud mask, mixed resolution), the full API flow on sample data, and the platform rules
+(organizations, roles, plan features, hectares, files, sign-in). Needs PostgreSQL with PostGIS: `DATABASE_URL`
+(default `postgresql://hub:hub@localhost:5432/farm_test`).
 
 ## Image acquisition requirements for real deployment
 

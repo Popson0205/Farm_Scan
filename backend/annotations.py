@@ -1,100 +1,54 @@
 """
-Share & Collaborate: generates read-only share tokens for a boundary+result,
-and stores annotations (point comments) on a farm — matching Solvi's
-"Annotations and comments" + "Sharing via public web links" features.
+Share & Collaborate: read-only share links for a farm (+ result), and annotations (point comments) on a farm —
+Solvi's "Annotations and comments" + "Sharing via public web links". Farms are checked to belong to the person's
+organization before these are called.
 """
-import os
 import secrets
-import sqlite3
-from pathlib import Path
+import uuid
 
-DB_PATH = Path(os.environ.get("FARMSCAN_DB", Path(__file__).parent / "farmscan.db"))
-
-
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+import db
 
 
-def init_sharing_tables():
-    conn = get_db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS share_links (
-            token TEXT PRIMARY KEY,
-            boundary_id TEXT NOT NULL,
-            index_name TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS annotations (
-            id TEXT PRIMARY KEY,
-            boundary_id TEXT NOT NULL,
-            lat REAL NOT NULL,
-            lng REAL NOT NULL,
-            comment TEXT NOT NULL,
-            author TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-def create_share_link(boundary_id: str, index_name: str = None) -> str:
+def create_share_link(boundary_id: str, index_name: str = None, created_by: str = None) -> str:
     token = secrets.token_urlsafe(12)
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO share_links (token, boundary_id, index_name) VALUES (?, ?, ?)",
-        (token, boundary_id, index_name),
-    )
-    conn.commit()
-    conn.close()
+    with db.tx() as conn:
+        conn.execute("INSERT INTO share_links (token, boundary_id, index_name, created_by) VALUES (%s, %s, %s, %s)",
+                     (token, boundary_id, index_name, created_by))
     return token
 
 
 def resolve_share_link(token: str):
-    conn = get_db()
-    row = conn.execute("SELECT * FROM share_links WHERE token = ?", (token,)).fetchone()
-    conn.close()
-    return dict(row) if row else None
+    with db.tx() as conn:
+        row = conn.execute("SELECT token, boundary_id::text AS boundary_id, index_name, created_at FROM share_links "
+                           "WHERE token = %s", (token,)).fetchone()
+    return row
 
 
-def add_annotation(boundary_id: str, lat: float, lng: float, comment: str, author: str = None) -> dict:
-    import uuid
+def add_annotation(boundary_id: str, lat: float, lng: float, comment: str, author: str = None, conn=None) -> dict:
     ann_id = str(uuid.uuid4())
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO annotations (id, boundary_id, lat, lng, comment, author) VALUES (?, ?, ?, ?, ?, ?)",
-        (ann_id, boundary_id, lat, lng, comment, author),
-    )
-    conn.commit()
-    conn.close()
-    return {"id": ann_id, "boundary_id": boundary_id, "lat": lat, "lng": lng,
-            "comment": comment, "author": author}
+    sql = "INSERT INTO annotations (id, boundary_id, lat, lng, comment, author) VALUES (%s, %s, %s, %s, %s, %s)"
+    if conn is not None:
+        conn.execute(sql, (ann_id, boundary_id, lat, lng, comment, author))
+    else:
+        with db.tx() as c:
+            c.execute(sql, (ann_id, boundary_id, lat, lng, comment, author))
+    return {"id": ann_id, "boundary_id": boundary_id, "lat": lat, "lng": lng, "comment": comment, "author": author}
 
 
 def list_annotations(boundary_id: str) -> list[dict]:
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM annotations WHERE boundary_id = ? ORDER BY created_at DESC", (boundary_id,)
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    with db.tx() as conn:
+        rows = conn.execute("SELECT id::text AS id, boundary_id::text AS boundary_id, lat, lng, comment, author, "
+                            "created_at::text AS created_at FROM annotations WHERE boundary_id = %s "
+                            "ORDER BY created_at DESC", (boundary_id,)).fetchall()
+    return rows
 
 
 AUTO_SCOUT_AUTHOR = "FarmScan scout"
 
 
 def replace_auto_scouting_notes(boundary_id: str, notes: list[dict]) -> list[dict]:
-    """Replaces this farm's machine-generated scouting notes with a fresh set
-    (so re-running problem-area detection doesn't pile up duplicates). Notes
-    written by people are never touched. notes: [{lat, lng, comment}]."""
-    conn = get_db()
-    conn.execute("DELETE FROM annotations WHERE boundary_id = ? AND author = ?",
-                 (boundary_id, AUTO_SCOUT_AUTHOR))
-    conn.commit()
-    conn.close()
-    return [add_annotation(boundary_id, n["lat"], n["lng"], n["comment"], AUTO_SCOUT_AUTHOR)
-            for n in notes]
+    """Replaces this farm's machine-generated scouting notes with a fresh set (so re-running problem-area detection
+    doesn't pile up duplicates). Notes written by people are never touched. notes: [{lat, lng, comment}]."""
+    with db.tx() as conn:
+        conn.execute("DELETE FROM annotations WHERE boundary_id = %s AND author = %s", (boundary_id, AUTO_SCOUT_AUTHOR))
+        return [add_annotation(boundary_id, n["lat"], n["lng"], n["comment"], AUTO_SCOUT_AUTHOR, conn=conn) for n in notes]

@@ -21,10 +21,7 @@ Design notes
   * Natural phenology (senescence, harvest) lowers vegetation indices too, so
     trend alerts are prompts to look, not diagnoses.
 """
-import os
-import sqlite3
 from datetime import date as _date
-from pathlib import Path
 from statistics import median
 
 import numpy as np
@@ -35,7 +32,7 @@ from rasterio.warp import transform_geom
 from scipy import ndimage as ndi
 from shapely.geometry import shape, mapping
 
-DB_PATH = Path(os.environ.get("FARMSCAN_DB", Path(__file__).parent / "farmscan.db"))
+import db
 
 # Indices where a LOW value means a crop problem (the direction we screen for).
 LOW_IS_BAD = {"ndvi", "ndre", "ndmi", "savi", "evi"}
@@ -62,34 +59,6 @@ DEFAULT_DROP_THRESHOLD = 0.05
 # Database
 # --------------------------------------------------------------------------
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_monitoring_tables():
-    conn = get_db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS observations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            boundary_id TEXT NOT NULL,
-            index_name TEXT NOT NULL,
-            obs_date TEXT NOT NULL,
-            source TEXT NOT NULL,
-            scene_id TEXT,
-            cloud_cover REAL,
-            valid_fraction REAL,
-            mean REAL, median REAL, std REAL, p10 REAL, p90 REAL,
-            pixel_count INTEGER,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE (boundary_id, index_name, obs_date, source)
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
 def robust_stats(arr: np.ndarray) -> dict:
     """Mean/median/std/p10/p90 over valid (non-NaN) pixels."""
     valid = arr[~np.isnan(arr)]
@@ -111,30 +80,30 @@ def save_observation(boundary_id: str, index_name: str, obs_date: str, source: s
     st = robust_stats(arr)
     if valid_fraction is None:
         valid_fraction = 1.0
-    conn = get_db()
-    conn.execute(
-        "INSERT OR REPLACE INTO observations (boundary_id, index_name, obs_date, source, "
-        "scene_id, cloud_cover, valid_fraction, mean, median, std, p10, p90, pixel_count) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (boundary_id, index_name, obs_date, source, scene_id, cloud_cover, valid_fraction,
-         st["mean"], st["median"], st["std"], st["p10"], st["p90"], st["pixel_count"]),
-    )
-    conn.commit()
-    conn.close()
+    with db.tx() as conn:
+        conn.execute(
+            "INSERT INTO observations (boundary_id, index_name, obs_date, source, scene_id, cloud_cover, valid_fraction, "
+            "mean, median, std, p10, p90, pixel_count) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (boundary_id, index_name, obs_date, source) DO UPDATE SET scene_id = EXCLUDED.scene_id, "
+            "cloud_cover = EXCLUDED.cloud_cover, valid_fraction = EXCLUDED.valid_fraction, mean = EXCLUDED.mean, "
+            "median = EXCLUDED.median, std = EXCLUDED.std, p10 = EXCLUDED.p10, p90 = EXCLUDED.p90, "
+            "pixel_count = EXCLUDED.pixel_count, created_at = now()",
+            (boundary_id, index_name, obs_date, source, scene_id, cloud_cover, valid_fraction,
+             st["mean"], st["median"], st["std"], st["p10"], st["p90"], st["pixel_count"]))
     return {"obs_date": obs_date, "source": source, "valid_fraction": valid_fraction, **st}
 
 
 def list_observations(boundary_id: str, index_name: str, source: str = None) -> list[dict]:
-    conn = get_db()
-    q = "SELECT * FROM observations WHERE boundary_id = ? AND index_name = ?"
+    q = ("SELECT id, boundary_id::text AS boundary_id, index_name, obs_date, source, scene_id, cloud_cover, valid_fraction, "
+         "mean, median, std, p10, p90, pixel_count, created_at::text AS created_at FROM observations "
+         "WHERE boundary_id = %s AND index_name = %s")
     params = [boundary_id, index_name]
     if source:
-        q += " AND source = ?"
+        q += " AND source = %s"
         params.append(source)
     q += " ORDER BY obs_date ASC"
-    rows = [dict(r) for r in conn.execute(q, params).fetchall()]
-    conn.close()
-    return rows
+    with db.tx() as conn:
+        return conn.execute(q, params).fetchall()
 
 
 # --------------------------------------------------------------------------

@@ -25,7 +25,6 @@ Accuracy notes
 """
 import json
 import os
-import sqlite3
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -33,7 +32,6 @@ from pathlib import Path
 import numpy as np
 import requests
 
-DB_PATH = Path(os.environ.get("FARMSCAN_DB", Path(__file__).parent / "farmscan.db"))
 
 OPEN_METEO_BASE = os.environ.get("OPEN_METEO_BASE_URL", "")  # optional commercial host
 OPEN_METEO_KEY = os.environ.get("OPEN_METEO_API_KEY", "")
@@ -63,35 +61,24 @@ class WeatherUnavailable(RuntimeError):
 # Cache
 # ---------------------------------------------------------------------------
 
-def _db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("CREATE TABLE IF NOT EXISTS api_cache ("
-                 "key TEXT PRIMARY KEY, payload TEXT NOT NULL, fetched_at REAL NOT NULL)")
-    return conn
-
-
 def _cache_get(key: str, ttl_s: float, allow_stale: bool = False):
-    conn = _db()
-    try:
-        row = conn.execute("SELECT payload, fetched_at FROM api_cache WHERE key = ?", (key,)).fetchone()
-    finally:
-        conn.close()
+    import db
+    with db.tx() as conn:
+        row = conn.execute("SELECT payload, fetched_at FROM api_cache WHERE key = %s", (key,)).fetchone()
     if not row:
         return None
-    age = time.time() - row[1]
+    age = time.time() - row["fetched_at"]
     if age <= ttl_s or allow_stale:
-        return {"payload": json.loads(row[0]), "age_s": age, "stale": age > ttl_s}
+        return {"payload": row["payload"], "age_s": age, "stale": age > ttl_s}
     return None
 
 
 def _cache_put(key: str, payload) -> None:
-    conn = _db()
-    try:
-        conn.execute("INSERT OR REPLACE INTO api_cache (key, payload, fetched_at) VALUES (?, ?, ?)",
-                     (key, json.dumps(payload), time.time()))
-        conn.commit()
-    finally:
-        conn.close()
+    import db
+    from psycopg.types.json import Jsonb
+    with db.tx() as conn:
+        conn.execute("INSERT INTO api_cache (key, payload, fetched_at) VALUES (%s, %s, %s) ON CONFLICT (key) DO UPDATE "
+                     "SET payload = EXCLUDED.payload, fetched_at = EXCLUDED.fetched_at", (key, Jsonb(payload), time.time()))
 
 
 # ---------------------------------------------------------------------------

@@ -73,6 +73,26 @@ def db_path() -> Path:
     return Path(os.environ.get("HWSD2_DB", DATA_DIR / "hwsd2.sqlite"))
 
 
+HWSD_FILES = ("HWSD2.bil", "HWSD2.hdr", "HWSD2.prj", "hwsd2.sqlite")
+
+
+def fetch_from_bucket() -> None:
+    """On a deployment, the soil dataset lives in the platform bucket under farm/data/hwsd/ (uploaded once, see
+    the README); fetch any file missing here at start-up so suitability works after every redeploy."""
+    from config import settings
+    if not settings.s3_on or "HWSD2_RASTER" in os.environ:
+        return
+    import storage
+    for name in HWSD_FILES:
+        dest = DATA_DIR / name
+        if dest.exists():
+            continue
+        got = storage.local_path(storage.key("data", "hwsd", name))
+        if got:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(got.read_bytes()) if got.stat().st_size < 50_000_000 else got.replace(dest)
+
+
 def status() -> dict:
     r, d = raster_path(), db_path()
     return {"raster": str(r), "raster_found": r.exists(), "database": str(d), "database_found": d.exists(),
