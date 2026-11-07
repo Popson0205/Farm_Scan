@@ -26,14 +26,10 @@ import db
 import demo_data
 import geo
 import identity
-import plots as plots_mod
 import storage
 import zones as zones_mod
 import exports as exports_mod
-import plant_count as plant_count_mod
-import drone_ingest
 import annotations as annotations_mod
-import plot_import as plot_import_mod
 import monitoring as monitoring_mod
 import season as season_mod
 import alerts as alerts_mod
@@ -47,7 +43,6 @@ from geoestate_id import GeoEstateIDError
 from identity import Problem, current_user, need, reader, writer
 
 log = logging.getLogger("farmscan")
-MAX_UPLOAD = 1024 * 1024 * 1024          # a drone orthomosaic: up to 1 GB
 
 # In-memory cache of the last computed index result per (boundary_id, index), so plot stats / zones / exports can
 # reuse the raster instead of recomputing. Farm ids are checked against the person's organization before use.
@@ -68,7 +63,7 @@ async def lifespan(_app):
     db.pool.close()
 
 
-app = FastAPI(title="FarmScan API", description="Satellite and drone farm health mapping, on the GeoEstate platform",
+app = FastAPI(title="FarmScan API", description="Satellite farm health mapping, on the GeoEstate platform",
               lifespan=lifespan)
 
 
@@ -460,231 +455,12 @@ def _finish_processing(index: str, band_arrays: dict, out_meta: dict,
     })
 
 
-# ---------------------------------------------------------------------------
-# Plot layout (regular grid, manual editing, SHP/KML import)
-# ---------------------------------------------------------------------------
-
-@app.post("/api/plots/generate-grid")
-def generate_grid_plots(boundary_id: str = Form(...), rows: int = Form(None), cols: int = Form(None),
-                        target_plot_count: int = Form(None), user=Depends(writer)):
-    """Manual/regular grid plot layout: splits the farm boundary into a rows x cols
-    grid of evenly-sized trial plots. Use this when you want a uniform layout
-    regardless of what's actually visible in imagery (e.g. planning plots before
-    planting). Plots that already exist elsewhere (QGIS, a trial-management
-    system) can be brought in with /api/plots/import, and any plot can be
-    adjusted with the edit/add/delete endpoints. Provide either rows+cols
-    directly, or target_plot_count to auto-estimate a grid."""
-    farm = _farm(user, boundary_id)
-    boundary_id, boundary_geojson = farm["id"], farm["geojson"]
-
-    if rows is None or cols is None:
-        if target_plot_count is None:
-            raise HTTPException(400, "Provide either rows+cols or target_plot_count")
-        rows, cols = plots_mod.estimate_grid_from_plot_count(boundary_geojson, target_plot_count)
-
-    if not (1 <= rows <= 200 and 1 <= cols <= 200):
-        raise HTTPException(400, "Rows and columns must each be between 1 and 200")
-    plot_list = plots_mod.generate_grid_plots(boundary_geojson, rows, cols)
-    _replace_plots(boundary_id, plot_list)
-
-    return {"rows": rows, "cols": cols, "plot_count": len(plot_list), "plots": plot_list}
-
-
-def _replace_plots(boundary_id: str, plot_list: list[dict]) -> None:
-    """Replace a farm's plots with a new set (grid or import)."""
-    with db.tx() as conn:
-        conn.execute("DELETE FROM plots WHERE boundary_id = %s", (boundary_id,))
-        with conn.cursor() as cur:
-            cur.executemany(
-                "INSERT INTO plots (id, boundary_id, plot_id, row_idx, col_idx, geojson, area_m2) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                [(str(uuid.uuid4()), boundary_id, p["plot_id"], p["row"], p["col"], Jsonb(p["geometry"]), p["area_m2"])
-                 for p in plot_list])
-
-
-def _plot_rows(boundary_id: str) -> list[dict]:
-    with db.tx() as conn:
-        return conn.execute("SELECT plot_id, row_idx, col_idx, geojson, area_m2 FROM plots WHERE boundary_id = %s "
-                            "ORDER BY plot_id", (boundary_id,)).fetchall()
-
-
-@app.get("/api/plots/{boundary_id}")
-def get_plots(boundary_id: str, user=Depends(reader)):
-    rows = _plot_rows(_farm(user, boundary_id)["id"])
-    return {
-        "plot_count": len(rows),
-        "plots": [{"plot_id": r["plot_id"], "row": r["row_idx"], "col": r["col_idx"], "geometry": r["geojson"],
-                   "area_m2": r["area_m2"]} for r in rows],
-    }
-
-
-@app.post("/api/plots/{boundary_id}/edit")
-def edit_plot(boundary_id: str, plot_id: int = Form(...), geojson: str = Form(...), user=Depends(writer)):
-    """
-    Advanced plot editing: replaces a single plot's geometry (e.g. after the user
-    drags/reshapes it on the map) without regenerating the whole set. row/col
-    labels are kept as-is; area_m2 is recomputed from the new geometry.
-    """
-    new_geom, area_m2 = _plot_geometry(geojson)
-    with db.tx() as conn:
-        bid = _farm(user, boundary_id, conn)["id"]
-        done = conn.execute("UPDATE plots SET geojson = %s, area_m2 = %s WHERE boundary_id = %s AND plot_id = %s",
-                            (Jsonb(new_geom), area_m2, bid, plot_id)).rowcount
-    if not done:
-        raise HTTPException(404, "Plot not found for this farm")
-    return {"plot_id": plot_id, "geometry": new_geom, "area_m2": area_m2}
-
-
-def _plot_geometry(geojson: str) -> tuple[dict, float]:
-    try:
-        new_geom = json.loads(geojson)
-    except json.JSONDecodeError:
-        raise HTTPException(400, "Invalid JSON in geojson field")
-    if not isinstance(new_geom, dict) or new_geom.get("type") not in ("Polygon", "MultiPolygon"):
-        raise HTTPException(400, "A plot must be a Polygon or MultiPolygon")
-    return new_geom, round(geo.area_m2(_valid_shape(new_geom)), 2)
-
-
-@app.post("/api/plots/{boundary_id}/add")
-def add_plot(boundary_id: str, geojson: str = Form(...), row: int = Form(None), col: int = Form(None),
-             user=Depends(writer)):
-    """Advanced plot editing: manually adds one new plot (e.g. one the grid missed). Assigns the next plot_id."""
-    new_geom, area_m2 = _plot_geometry(geojson)
-    with db.tx() as conn:
-        bid = _farm(user, boundary_id, conn)["id"]
-        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (bid,))
-        m = conn.execute("SELECT max(plot_id) AS m FROM plots WHERE boundary_id = %s", (bid,)).fetchone()["m"]
-        next_plot_id = 0 if m is None else m + 1
-        conn.execute("INSERT INTO plots (id, boundary_id, plot_id, row_idx, col_idx, geojson, area_m2) "
-                     "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                     (str(uuid.uuid4()), bid, next_plot_id, row, col, Jsonb(new_geom), area_m2))
-    return {"plot_id": next_plot_id, "row": row, "col": col, "geometry": new_geom, "area_m2": area_m2}
-
-
-@app.delete("/api/plots/{boundary_id}/{plot_id}")
-def delete_plot(boundary_id: str, plot_id: int, user=Depends(writer)):
-    """Advanced plot editing: removes a single plot (e.g. an edge plot that isn't part of the trial)."""
-    with db.tx() as conn:
-        bid = _farm(user, boundary_id, conn)["id"]
-        done = conn.execute("DELETE FROM plots WHERE boundary_id = %s AND plot_id = %s", (bid, plot_id)).rowcount
-    if not done:
-        raise HTTPException(404, "Plot not found for this farm")
-    return {"deleted": True, "plot_id": plot_id}
-
-
-@app.post("/api/plots/import")
-async def import_plots(boundary_id: str = Form(...), file: UploadFile = File(...), user=Depends(writer)):
-    """
-    Import existing plots from a SHP (zipped shapefile: .shp/.shx/.dbf/.prj) or
-    KML file, replacing any current plots for this boundary — for trials where
-    plot boundaries were already digitized elsewhere (e.g. in QGIS or a trial
-    management system) rather than drawn in FarmScan.
-    """
-    boundary_id = _farm(user, boundary_id)["id"]
-
-    filename = file.filename or ""
-    suffix = Path(filename).suffix.lower()
-    if suffix not in (".zip", ".kml", ".shp"):
-        raise HTTPException(400, "Upload a zipped shapefile (.zip), a bare .shp, or a .kml file")
-
-    content = await file.read(50 * 1024 * 1024 + 1)
-    if len(content) > 50 * 1024 * 1024:
-        raise HTTPException(413, "The plot file is over 50 MB")
-    try:
-        plot_list = plot_import_mod.parse_plots_file(content, suffix)
-    except Exception as e:
-        raise HTTPException(400, f"Could not read plot file: {e}")
-
-    if not plot_list:
-        raise HTTPException(400, "No polygon features found in the uploaded file")
-
-    _replace_plots(boundary_id, plot_list)
-    return {"plot_count": len(plot_list), "plots": plot_list, "source": f"imported_{suffix.lstrip('.')}"}
-
-
-def _compute_plot_stats(boundary_id: str, index: str) -> dict:
-    """Per-plot statistics for an already-processed index (Solvi's 'extensive
-    statistics for each plot in a single click'). Requires plots to have been
-    generated via /api/plots/generate-grid and the index processed already."""
-    cached = _cached(boundary_id, index)
-    plot_rows = _plot_rows(boundary_id)
-    if not plot_rows:
-        raise HTTPException(400, "This farm has no plots yet — generate a grid, draw or import plots first.")
-
-    idx_array = cached["array"]
-    transform = cached["transform"]
-    crs = cached["crs"]
-
-    # build an in-memory single-band raster so we can rasterio.mask clip per plot
-    profile = {
-        "driver": "GTiff", "dtype": "float32", "nodata": np.nan,
-        "width": idx_array.shape[1], "height": idx_array.shape[0],
-        "count": 1, "crs": crs, "transform": transform,
-    }
-
-    results = []
-    no_data_count = 0
-    with rasterio.io.MemoryFile() as memfile:
-        with memfile.open(**profile) as ds:
-            ds.write(idx_array.astype(np.float32), 1)
-
-        with memfile.open() as ds:
-            for p in plot_rows:
-                plot_geom = p["geojson"]
-                reason = None
-                try:
-                    clipped, _ = rio_mask(ds, [plot_geom], crop=True, nodata=np.nan)
-                    plot_arr = clipped[0]
-                    valid_mask = ~np.isnan(plot_arr)
-                    stats = zonal_stats(plot_arr, valid_mask)
-                    if stats["mean"] is None:
-                        reason = ("Plot falls outside the processed boundary shape (inside its "
-                                   "bounding box, but outside the polygon) — redraw the boundary "
-                                   "to fully cover this plot, or re-run the index.")
-                except Exception as e:
-                    stats = {"mean": None, "min": None, "max": None, "std": None, "pixel_count": 0}
-                    reason = f"Could not clip this plot against the processed raster ({e})"
-
-                if reason:
-                    no_data_count += 1
-
-                results.append({
-                    "plot_id": p["plot_id"], "row": p["row_idx"], "col": p["col_idx"],
-                    "area_m2": p["area_m2"], **stats, "no_data_reason": reason,
-                })
-
-    return {
-        "index": index, "plot_count": len(results), "plots": results,
-        "no_data_count": no_data_count,
-    }
-
-
-
-
 def _cached(boundary_id: str, index: str) -> dict:
     cached = _RESULT_CACHE.get(f"{boundary_id}:{index}")
     if not cached:
         raise HTTPException(400, f"No processed '{index}' result for this farm — run the index first.")
     return cached
 
-
-@app.post("/api/plots/zonal-stats")
-def plots_zonal_stats(boundary_id: str = Form(...), index: str = Form(...), user=Depends(reader)):
-    """Per-plot statistics for an already-processed index (mean/min/max/std/pixel_count per
-    plot). Requires plots (generate-grid / import) and the index processed first."""
-    return _compute_plot_stats(_farm(user, boundary_id)["id"], index)
-
-
-@app.post("/api/plots/performance")
-def plots_performance(boundary_id: str = Form(...), index: str = Form(...), user=Depends(reader)):
-    """Ranks plots against the field baseline (z-score vs median plot), flags
-    underperforming / watch plots, and reports field uniformity and the headroom between
-    the median plot and the top quartile. Uses the cached index raster."""
-    stats = _compute_plot_stats(_farm(user, boundary_id)["id"], index)
-    try:
-        ranked = monitoring_mod.rank_plots(stats["plots"])
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    return {"index": index, **ranked}
 
 
 # ---------------------------------------------------------------------------
@@ -794,25 +570,6 @@ def export_geotiff(boundary_id: str, index: str, user=Depends(reader)):
     )
 
 
-@app.get("/api/export/shp/plots")
-def export_plots_shp(boundary_id: str, user=Depends(reader)):
-    boundary_id = _farm(user, boundary_id)["id"]
-    rows = _plot_rows(boundary_id)
-    if not rows:
-        raise HTTPException(400, "This farm has no plots yet.")
-
-    features = [
-        {"geometry": r["geojson"], "plot_id": r["plot_id"],
-         "row": r["row_idx"], "col": r["col_idx"], "area_m2": r["area_m2"]}
-        for r in rows
-    ]
-    zip_bytes = exports_mod.geometries_to_shapefile_zip_bytes(features, layer_name="plots")
-    return StreamingResponse(
-        io.BytesIO(zip_bytes), media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="plots_{boundary_id[:8]}.zip"'},
-    )
-
-
 @app.get("/api/export/shp/zones")
 def export_zones_shp(boundary_id: str, index: str, n_zones: int = 3, user=Depends(need(feature="zones"))):
     boundary_id = _farm(user, boundary_id)["id"]
@@ -834,138 +591,19 @@ def export_zones_shp(boundary_id: str, index: str, n_zones: int = 3, user=Depend
     )
 
 
-@app.get("/api/export/excel/plots")
-def export_plots_excel(boundary_id: str, index: str, user=Depends(reader)):
-    """Re-runs the same zonal-stats logic as /api/plots/zonal-stats and returns it as .xlsx."""
-    boundary_id = _farm(user, boundary_id)["id"]
-    resp = _compute_plot_stats(boundary_id, index)
-    plot_stats = resp["plots"]
-    xlsx_bytes = exports_mod.plot_stats_to_excel_bytes(plot_stats, sheet_title=f"{index.upper()} Plot Stats")
-    return StreamingResponse(
-        io.BytesIO(xlsx_bytes),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="plot_stats_{index}_{boundary_id[:8]}.xlsx"'},
-    )
-
-
 @app.get("/api/export/pdf")
 def export_pdf(boundary_id: str, index: str, user=Depends(reader)):
     farm = _farm(user, boundary_id)
     boundary_id, farm_name = farm["id"], farm["name"]
     cached = _cached(boundary_id, index)
-    plot_count = len(_plot_rows(boundary_id))
 
     pdf_bytes = exports_mod.build_pdf_report_bytes(
-        farm_name, cached["label"], cached["stats"], plot_count, overlay_png_bytes=cached["png_bytes"]
+        farm_name, cached["label"], cached["stats"], overlay_png_bytes=cached["png_bytes"]
     )
     return StreamingResponse(
         io.BytesIO(pdf_bytes), media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="report_{index}_{boundary_id[:8]}.pdf"'},
     )
-
-
-# ---------------------------------------------------------------------------
-# Drone orthomosaic upload + plant counting
-# ---------------------------------------------------------------------------
-
-@app.post("/api/drone/upload")
-async def upload_drone_image(file: UploadFile = File(...), user=Depends(need("agronomist", write=True, feature="drone"))):
-    """Upload a stitched drone orthomosaic GeoTIFF (Pix4D/Agisoft/DroneDeploy/OpenDroneMap output). Kept in the
-    platform bucket for the organization. Returns metadata so the person can confirm the bands before running plant
-    counts on it."""
-    if not (file.filename or "").lower().endswith((".tif", ".tiff")):
-        raise HTTPException(400, "Please upload a GeoTIFF (.tif/.tiff) orthomosaic")
-    file_id = str(uuid.uuid4())
-    tmp = Path(tempfile.mkdtemp(prefix="farm-drone-")) / f"{file_id}.tif"
-    size = 0
-    with open(tmp, "wb") as f:
-        while chunk := await file.read(8 * 1024 * 1024):
-            size += len(chunk)
-            if size > MAX_UPLOAD:
-                tmp.unlink(missing_ok=True)
-                raise HTTPException(413, "The orthomosaic is over 1 GB. Export it at a coarser resolution (2–5 cm/pixel is enough).")
-            f.write(chunk)
-    try:
-        meta = drone_ingest.inspect_orthomosaic(str(tmp))
-        preview = drone_ingest.generate_preview(str(tmp))
-    except Exception as e:
-        tmp.unlink(missing_ok=True)
-        raise HTTPException(400, f"Could not read file as GeoTIFF: {e}")
-    k = storage.key("orgs", user["org_id"], "drone", f"{file_id}.tif")
-    storage.put_file(tmp, k, "image/tiff")
-    with db.tx() as conn:
-        conn.execute("INSERT INTO drone_files (id, org_id, filename, storage_key, size_bytes, uploaded_by) "
-                     "VALUES (%s, %s, %s, %s, %s, %s)", (file_id, user["org_id"], file.filename[:200], k, size, user["name"]))
-    return {"drone_file_id": file_id, **meta, **preview}
-
-
-def _drone_file(user: dict, drone_file_id: str) -> str:
-    """A local copy of one of the organization's orthomosaics."""
-    with db.tx() as conn:
-        row = conn.execute("SELECT storage_key FROM drone_files WHERE id = %s AND org_id = %s",
-                           (_uuid(drone_file_id, "Drone file"), user["org_id"])).fetchone()
-    path = storage.local_path(row["storage_key"]) if row else None
-    if not path:
-        raise HTTPException(404, "Uploaded drone file not found — upload the orthomosaic again.")
-    return str(path)
-
-
-@app.post("/api/drone/plant-count")
-def drone_plant_count(drone_file_id: str = Form(...), boundary_id: str = Form(None), min_plant_area_px: int = Form(15),
-                      user=Depends(need(feature="plant_count"))):
-    """
-    Runs blob/watershed-based plant detection on an uploaded drone orthomosaic.
-    Requires centimeter-scale imagery — will not work meaningfully on satellite data.
-    See plant_count.py docstring for accuracy caveats (baseline method, not a
-    trained model — best on widely-spaced row/nursery crops).
-    """
-    file_path = _drone_file(user, drone_file_id)
-    boundary_geojson = _farm(user, boundary_id)["geojson"] if boundary_id else None
-
-    rgb, meta = drone_ingest.load_rgb_for_plant_count(file_path, boundary_geojson)
-    result = plant_count_mod.count_plants(rgb, min_plant_area_px=min_plant_area_px)
-    geo_points = plant_count_mod.pixel_centroids_to_geojson_points(
-        result["centroids_px"], result["areas_px"], meta["transform"], meta["crs"]
-    )
-
-    return {
-        "plant_count": result["count"],
-        "mean_canopy_area_px": result["mean_canopy_area_px"],
-        "plants": geo_points,
-        "note": "Baseline blob/watershed detector — best accuracy on widely-spaced row or "
-                "nursery crops with cm-resolution imagery. For dense closed-canopy fields, "
-                "accuracy will be lower without a crop-specific trained model.",
-    }
-
-
-@app.post("/api/drone/plant-count-per-plot")
-def drone_plant_count_per_plot(drone_file_id: str = Form(...), boundary_id: str = Form(...),
-                               min_plant_area_px: int = Form(15), user=Depends(need(feature="plant_count"))):
-    """
-    Plant counts broken down per plot, rather than one field-wide total. Requires plots to already exist for this
-    farm (from a grid, drawing or import).
-    """
-    file_path = _drone_file(user, drone_file_id)
-    farm = _farm(user, boundary_id)
-    plot_rows = _plot_rows(farm["id"])
-    if not plot_rows:
-        raise HTTPException(400, "This farm has no plots yet — generate a grid, draw or import plots first.")
-    plots = [{"plot_id": r["plot_id"], "row": r["row_idx"], "col": r["col_idx"], "geometry": r["geojson"]}
-             for r in plot_rows]
-
-    rgb, meta = drone_ingest.load_rgb_for_plant_count(file_path, farm["geojson"])
-    result = plant_count_mod.count_plants(rgb, min_plant_area_px=min_plant_area_px)
-    geo_points = plant_count_mod.pixel_centroids_to_geojson_points(
-        result["centroids_px"], result["areas_px"], meta["transform"], meta["crs"]
-    )
-    per_plot = plant_count_mod.aggregate_plants_per_plot(geo_points, plots)
-
-    return {
-        "boundary_id": farm["id"],
-        "total_plant_count": result["count"],
-        "plot_count": len(per_plot),
-        "plots": per_plot,
-    }
 
 
 # ---------------------------------------------------------------------------

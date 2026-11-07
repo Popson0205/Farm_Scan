@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     id_secret: str = ""
     cookie_secure: bool | None = None          # default: secure when APP_URL is https
 
-    # Files (drone orthomosaics, the soil dataset): the platform's S3-compatible bucket, under S3_PREFIX.
+    # Files (the soil dataset): the platform's S3-compatible bucket, under S3_PREFIX.
     # Left empty (development, tests): files stay in backend/uploads.
     s3_endpoint: str = ""
     s3_access_key: str = ""

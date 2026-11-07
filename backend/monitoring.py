@@ -9,7 +9,6 @@ Field monitoring: turns an index raster into decisions an agronomist can act on.
   3. Problem areas         - finds contiguous patches that are clearly below
                              the field's norm, ranks them by impact, and gives
                              each a centroid so a scout knows where to walk.
-  4. Plot performance      - ranks plots against the field baseline.
 
 Design notes
   * Everything is relative to the field's own distribution (median / robust
@@ -289,52 +288,3 @@ def scouting_note_text(area: dict, index_name: str, obs_date: str) -> str:
             f"{area['mean_value']:.2f} vs field {area['field_median']:.2f} "
             f"({area['area_ha']:.2f} ha, {area['pct_of_field']:.0f}% of field, {obs_date}). "
             f"Check: {CHECK_FIRST.get(index_name, 'cause on the ground')}")
-
-
-# --------------------------------------------------------------------------
-# Plot performance
-# --------------------------------------------------------------------------
-
-def rank_plots(plot_stats: list[dict], watch_z: float = -1.0, under_z: float = -1.5) -> dict:
-    """
-    plot_stats: per-plot rows with 'mean' (None when no data), as returned by the
-    zonal-stats logic. Ranks plots against the field baseline.
-
-    z = (plot mean - median of plot means) / robust spread of plot means.
-    Flags: 'underperforming' (z <= under_z), 'watch' (z <= watch_z), 'ok', 'top' (z >= 1).
-    Also reports the uniformity of the field (CV of plot means) and the gap between the
-    median plot and the top quartile - the headroom if weaker plots were brought up.
-    """
-    rows = [p for p in plot_stats if p.get("mean") is not None]
-    if len(rows) < 3:
-        raise ValueError("Need at least 3 plots with data to rank performance.")
-
-    means = np.array([p["mean"] for p in rows], dtype=float)
-    med = float(np.median(means))
-    spread = 1.4826 * float(np.median(np.abs(means - med)))
-    spread = max(spread, float(np.std(means)) * 0.5, 0.01)
-    q75 = float(np.percentile(means, 75))
-
-    out = []
-    for p in rows:
-        z = (p["mean"] - med) / spread
-        flag = ("underperforming" if z <= under_z else "watch" if z <= watch_z
-                else "top" if z >= 1.0 else "ok")
-        out.append({**p, "z_score": round(z, 2), "vs_median": round(p["mean"] - med, 3),
-                    "gap_to_top_quartile": round(max(0.0, q75 - p["mean"]), 3), "flag": flag})
-    out.sort(key=lambda p: p["mean"])
-    for rank, p in enumerate(out, 1):
-        p["rank_from_bottom"] = rank
-
-    cv = float(np.std(means) / abs(np.mean(means))) * 100 if np.mean(means) else None
-    return {
-        "plots": out,
-        "summary": {
-            "plots_ranked": len(out), "median_plot_mean": round(med, 3),
-            "top_quartile_mean": round(q75, 3), "headroom_median_to_top_quartile": round(q75 - med, 3),
-            "uniformity_cv_pct": round(cv, 1) if cv is not None else None,
-            "underperforming": sum(1 for p in out if p["flag"] == "underperforming"),
-            "watch": sum(1 for p in out if p["flag"] == "watch"),
-            "unranked_no_data": len(plot_stats) - len(rows),
-        },
-    }
