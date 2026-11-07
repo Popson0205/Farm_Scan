@@ -10,6 +10,7 @@ import zipfile
 from pathlib import Path
 
 import numpy as np
+import geo
 import geopandas as gpd
 from shapely.geometry import mapping
 
@@ -88,10 +89,7 @@ def parse_plots_file(content: bytes, suffix: str) -> list[dict]:
     plot_list = []
     for i, (_, r) in enumerate(gdf.iterrows()):
         geom = r.geometry
-        lat = geom.centroid.y
-        m_per_deg_lat = 111320.0
-        m_per_deg_lon = 111320.0 * np.cos(np.radians(lat))
-        area_m2 = round(geom.area * m_per_deg_lat * m_per_deg_lon, 2)
+        area_m2 = round(geo.area_m2(geom), 2)       # on the ellipsoid
 
         if row_cols:
             row, col = row_cols[i]
