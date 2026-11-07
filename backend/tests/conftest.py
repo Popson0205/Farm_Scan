@@ -20,7 +20,7 @@ import db  # noqa: E402
 import identity  # noqa: E402
 
 ORG = "11111111-1111-4111-8111-111111111111"
-ALL = ["monitoring", "zones", "suitability", "drone", "plant_count", "prescriptions"]
+ALL = ["monitoring", "zones", "suitability", "alerts", "drone", "plant_count", "prescriptions", "verification"]
 
 
 def make_user(**kw) -> dict:

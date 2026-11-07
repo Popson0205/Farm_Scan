@@ -6,7 +6,8 @@ import tempfile
 import uuid
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date as date_cls, timedelta
+import threading
+from datetime import date as date_cls, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -35,6 +36,9 @@ import annotations as annotations_mod
 import plot_import as plot_import_mod
 import monitoring as monitoring_mod
 import season as season_mod
+import alerts as alerts_mod
+import mailer
+import reports as reports_mod
 import soil as soil_mod
 import weather as weather_mod
 import suitability as suitability_mod
@@ -57,7 +61,10 @@ async def lifespan(_app):
         conn.execute("UPDATE season_jobs SET status = 'failed', message = 'FarmScan restarted while this ran: start it again.', "
                      "finished_at = now() WHERE status IN ('queued', 'running')")
     soil_mod.fetch_from_bucket()
+    stop = threading.Event()
+    threading.Thread(target=_alerts_loop, args=(stop,), daemon=True, name="weekly-alerts").start()
     yield
+    stop.set()
     db.pool.close()
 
 
@@ -167,6 +174,7 @@ def sign_out(request: Request):
 
 @app.get("/api/me", summary="Who is signed in, their role, the plan's features and hectares used")
 def me(user=Depends(current_user)):
+    _remember_licence(user)
     with db.tx() as conn:
         used = conn.execute("SELECT coalesce(sum(area_ha), 0) AS ha, count(*) AS farms FROM boundaries WHERE org_id = %s",
                             (user["org_id"],)).fetchone()
@@ -1523,6 +1531,224 @@ def season(boundary_id: str, start_date: str = None, end_date: str = None, user=
         },
         "cloudy_images": len(nd) - len(usable),
     }
+
+
+# ---------------------------------------------------------------------------
+# Weekly farm alerts
+# ---------------------------------------------------------------------------
+
+def _remember_licence(user: dict) -> None:
+    """Keep what the organization's licence allows, for the alerts sent with nobody signed in."""
+    with db.tx() as conn:
+        conn.execute("INSERT INTO org_settings (org_id, org_name, features, licence, seen_at) VALUES (%s, %s, %s, %s, now()) "
+                     "ON CONFLICT (org_id) DO UPDATE SET org_name = EXCLUDED.org_name, features = EXCLUDED.features, "
+                     "licence = EXCLUDED.licence, seen_at = now()",
+                     (user["org_id"], user["org_name"], Jsonb(user["features"]), user["licence"]))
+
+
+def org_alerts(org_id: str, today: date_cls | None = None) -> dict:
+    """This week's alerts for each of the organization's farms. Each source that cannot be reached is reported, and
+    the others still run."""
+    today = today or date_cls.today()
+    with db.tx() as conn:
+        farms = conn.execute("SELECT id::text AS id, name, geojson, ST_Y(ST_Centroid(geom)) AS lat, ST_X(ST_Centroid(geom)) AS lng "
+                             "FROM boundaries WHERE org_id = %s ORDER BY name", (org_id,)).fetchall()
+    unavailable: set[str] = set()
+    wx_cache: dict = {}
+    out = []
+    for f in farms:
+        found = []
+        cell = (round(f["lat"], 1), round(f["lng"], 1))                 # one weather call per ~10 km cell
+        if cell not in wx_cache:
+            try:
+                wx = weather_mod.get_recent_and_ahead(f["lat"], f["lng"])
+                try:
+                    climate = weather_mod.climate_summary(weather_mod.get_daily_history(f["lat"], f["lng"], 10))
+                except weather_mod.WeatherUnavailable:
+                    climate = None
+                wx_cache[cell] = (wx, climate)
+            except weather_mod.WeatherUnavailable:
+                wx_cache[cell] = None
+        if wx_cache[cell]:
+            wx, climate = wx_cache[cell]
+            found += alerts_mod.weather_alerts(wx, alerts_mod.wet_months_of(climate), today)
+        else:
+            unavailable.add("weather")
+        try:
+            fires = alerts_mod.fetch_fires(f["geojson"])
+            if fires is None:
+                unavailable.add("fire (FIRMS_MAP_KEY not set)")
+            else:
+                found += alerts_mod.fire_alerts(fires, f["geojson"])
+        except Exception:
+            unavailable.add("fire")
+        for index, sources in (("ndvi", ("live",)), ("rvi", ("sentinel-1",))):
+            obs = [o for o in monitoring_mod.list_observations(f["id"], index) if o["source"] in sources]
+            if obs:
+                found += alerts_mod.crop_alerts(monitoring_mod.analyze_trend(obs), index, today)
+        if found:
+            out.append({"boundary_id": f["id"], "name": f["name"], "alerts": found})
+    return {"farms_checked": len(farms), "farms": out, "alert_count": sum(len(x["alerts"]) for x in out),
+            "unavailable": sorted(unavailable), "checked_on": today.isoformat()}
+
+
+@app.get("/api/alerts", summary="This week's alerts on the organization's farms (as the weekly email would send them)")
+def get_alerts(user=Depends(need(feature="alerts"))):
+    _remember_licence(user)
+    with db.tx() as conn:
+        sub = conn.execute("SELECT 1 FROM alert_subscribers WHERE org_id = %s AND user_id = %s", (user["org_id"], user["id"])).fetchone()
+        last = conn.execute("SELECT sent_at::text AS sent_at, recipients FROM alert_runs WHERE org_id = %s ORDER BY sent_at DESC LIMIT 1",
+                            (user["org_id"],)).fetchone()
+    return org_alerts(user["org_id"]) | {"subscribed": bool(sub), "last_email": last, "email_set_up": mailer.configured()}
+
+
+@app.post("/api/alerts/subscribe", summary="Email me the weekly alerts")
+def alerts_subscribe(user=Depends(need(feature="alerts"))):
+    _remember_licence(user)
+    with db.tx() as conn:
+        conn.execute("INSERT INTO alert_subscribers (org_id, user_id, email, name) VALUES (%s, %s, %s, %s) ON CONFLICT (org_id, user_id) "
+                     "DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name", (user["org_id"], user["id"], user["email"], user["name"]))
+    return {"subscribed": True, "email": user["email"]}
+
+
+@app.delete("/api/alerts/subscribe", summary="Stop emailing me the weekly alerts")
+def alerts_unsubscribe(user=Depends(reader)):
+    with db.tx() as conn:
+        conn.execute("DELETE FROM alert_subscribers WHERE org_id = %s AND user_id = %s", (user["org_id"], user["id"]))
+    return {"subscribed": False}
+
+
+ALERT_EVERY = timedelta(days=7)
+
+
+def send_due_alerts(now: datetime | None = None) -> list[str]:
+    """Send the weekly email to each organization that is due: it has subscribers, its licence (as last seen, within 60
+    days) includes alerts and is not expired or suspended, and its last email was a week ago or more. Returns the
+    organizations sent to. Safe to run from several processes (an advisory lock per organization)."""
+    now = now or datetime.now(timezone.utc)
+    sent = []
+    with db.tx() as conn:
+        orgs = conn.execute(
+            "SELECT s.org_id::text AS org_id, s.org_name FROM org_settings s WHERE s.features ? 'alerts' "
+            "AND s.licence IN ('demo', 'active', 'grace') AND s.seen_at > %s "
+            "AND EXISTS (SELECT 1 FROM alert_subscribers a WHERE a.org_id = s.org_id) "
+            "AND NOT EXISTS (SELECT 1 FROM alert_runs r WHERE r.org_id = s.org_id AND r.sent_at > %s)",
+            (now - timedelta(days=60), now - ALERT_EVERY + timedelta(hours=1))).fetchall()
+    for o in orgs:
+        with db.tx() as conn:
+            if not conn.execute("SELECT pg_try_advisory_xact_lock(hashtext('alerts:' || %s))", (o["org_id"],)).fetchone()["pg_try_advisory_xact_lock"]:
+                continue
+            if conn.execute("SELECT 1 FROM alert_runs WHERE org_id = %s AND sent_at > %s",
+                            (o["org_id"], now - ALERT_EVERY + timedelta(hours=1))).fetchone():
+                continue
+            subs = conn.execute("SELECT email FROM alert_subscribers WHERE org_id = %s", (o["org_id"],)).fetchall()
+            result = org_alerts(o["org_id"], now.date())
+            if result["farms"]:
+                subject, body = alerts_mod.email_text(o["org_name"] or "your organization", result["farms"], settings.app_url)
+                for s_ in subs:
+                    try:
+                        mailer.send(s_["email"], subject, body)
+                    except Exception as e:
+                        log.warning("alerts: could not email %s: %s", s_["email"], e)
+            conn.execute("INSERT INTO alert_runs (org_id, farms, alerts, recipients) VALUES (%s, %s, %s, %s)",
+                         (o["org_id"], len(result["farms"]), Jsonb(result), len(subs) if result["farms"] else 0))
+            sent.append(o["org_id"])
+    return sent
+
+
+def _alerts_loop(stop: threading.Event) -> None:
+    while not stop.wait(3600):
+        try:
+            if mailer.configured():
+                send_due_alerts()
+        except Exception:
+            log.exception("weekly alerts run failed")
+
+
+# ---------------------------------------------------------------------------
+# Farm verification reports
+# ---------------------------------------------------------------------------
+
+@app.post("/api/reports/verification", summary="Issue a numbered farm verification report (PDF), kept as issued")
+def issue_verification(boundary_id: str = Form(...), user=Depends(need("agronomist", write=True, feature="verification"))):
+    farm = _farm(user, boundary_id)
+    geom = shape(farm["geojson"])
+    c = geom.centroid
+    d = farm.get("details") or {}
+    declared = d.get("declared_ha")
+    seasons, n_opt, n_rad = [], 0, 0
+    nd = [o for o in monitoring_mod.list_observations(farm["id"], "ndvi") if o["source"] == "live"
+          and (o["valid_fraction"] or 0) >= monitoring_mod.MIN_VALID_FRACTION and o["mean"] is not None]
+    rv = [o for o in monitoring_mod.list_observations(farm["id"], "rvi") if o["source"] == "sentinel-1" and o["median"] is not None]
+    years = sorted({o["obs_date"][:4] for o in nd + rv})[-3:]
+    for y in years:
+        ny = [(o["obs_date"], o["mean"]) for o in nd if o["obs_date"].startswith(y)]
+        ry = [(o["obs_date"], o["median"]) for o in rv if o["obs_date"].startswith(y)]
+        n_opt, n_rad = n_opt + len(ny), n_rad + len(ry)
+        r = season_mod.season_reading(ny, ry)
+        why = None if r["based_on"] else " ".join(x for x in (r["optical"].get("reason"), r["radar"].get("reason")) if x)
+        seasons.append({"year": int(y), "based_on": r["based_on"], "why": why,
+                        **{k: r.get(k) for k in ("planting", "greenup", "peak", "end")}})
+    try:
+        hist = weather_mod.get_daily_history(c.y, c.x, 10)
+        rain = reports_mod.rainfall(hist, weather_mod.climate_summary(hist))
+    except weather_mod.WeatherUnavailable:
+        rain = None
+    issued_at, issued_on = reports_mod.issued_now()
+    code = reports_mod.new_code()
+    content = {
+        "code": code, "issued_at": issued_at, "issued_on": issued_on, "org_name": user["org_name"], "issued_by": user["name"],
+        "verify_url": f"{settings.app_url}/verify.html?code={code}",
+        "farm": {"name": farm["name"], "area_ha": farm["area_ha"], "lat": c.y, "lng": c.x,
+                 "declared_ha": declared, "declared_vs_measured_pct": round(100 * (float(declared) - farm["area_ha"]) / farm["area_ha"])
+                 if declared else None, "community": d.get("community"), "lga": d.get("lga"), "state": d.get("state"),
+                 "farmer": d.get("farmer_name"), "crops": d.get("crops"), "mapped_by": d.get("collected_by") if farm.get("source") == "geohub" else None},
+        "geometry": farm["geojson"], "seasons": seasons, "images": {"optical": n_opt, "radar": n_rad},
+        "rainfall": rain, "title": reports_mod.title_status(c.y, c.x),
+    }
+    rid = str(uuid.uuid4())
+    with db.tx() as conn:
+        conn.execute("INSERT INTO farm_reports (id, code, org_id, org_name, boundary_id, content, created_by) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                     (rid, code, user["org_id"], user["org_name"], farm["id"], Jsonb(content), user["name"]))
+    return {"id": rid, "code": code, "pdf": f"/api/reports/{rid}/pdf", "seasons": len(seasons),
+            "warnings": [w for w, bad in (("The farm's satellite timeline is empty: build the season first.", not seasons),
+                                          ("Rainfall could not be fetched.", rain is None)) if bad]}
+
+
+@app.get("/api/reports", summary="The organization's verification reports (optionally for one farm)")
+def list_reports(boundary_id: str | None = None, user=Depends(reader)):
+    q = ("SELECT id::text AS id, code, boundary_id::text AS boundary_id, content->'farm'->>'name' AS farm, created_by, "
+         "created_at::text AS created_at FROM farm_reports WHERE org_id = %s")
+    args = [user["org_id"]]
+    if boundary_id:
+        q += " AND boundary_id = %s"
+        args.append(_farm(user, boundary_id)["id"])
+    with db.tx() as conn:
+        return conn.execute(q + " ORDER BY created_at DESC LIMIT 200", args).fetchall()
+
+
+@app.get("/api/reports/{report_id}/pdf")
+def report_pdf(report_id: str, user=Depends(reader)):
+    with db.tx() as conn:
+        row = conn.execute("SELECT code, content FROM farm_reports WHERE id = %s AND org_id = %s",
+                           (_uuid(report_id, "Report"), user["org_id"])).fetchone()
+    if not row:
+        raise Problem(404, "Report not found", code="not_found")
+    return StreamingResponse(io.BytesIO(reports_mod.build_pdf(row["content"])), media_type="application/pdf",
+                             headers={"Content-Disposition": f'attachment; filename="{row["code"]}.pdf"'})
+
+
+@app.get("/api/verify/{code}", summary="Anyone holding a report checks it is genuine (no sign-in)")
+def verify_report(code: str):
+    with db.tx() as conn:
+        row = conn.execute("SELECT code, org_name, created_at::text AS created_at, content FROM farm_reports WHERE code = %s",
+                           (code.strip().upper()[:20],)).fetchone()
+    if not row:
+        return {"valid": False, "code": code}
+    f = row["content"]["farm"]
+    return {"valid": True, "code": row["code"], "issued_to": row["org_name"], "issued_at": row["created_at"],
+            "farm": f["name"], "area_ha": f["area_ha"], "where": ", ".join(x for x in (f.get("community"), f.get("lga"), f.get("state")) if x),
+            "seasons": [s["year"] for s in row["content"]["seasons"] if s.get("based_on")]}
 
 
 app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")
