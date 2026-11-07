@@ -40,7 +40,15 @@ def title_status(lat: float, lng: float) -> dict | None:
     why = {401: "the key is not Land Registry's: LAND_PLATFORM_KEY must equal Land Registry's PLATFORM_KEY",
            404: "nothing answers there: LAND_API should be Land Registry's address followed by /api",
            405: "nothing answers there: LAND_API should be Land Registry's address followed by /api",
-           503: "Land Registry has no PLATFORM_KEY set"}.get(r.status_code, f"it answered {r.status_code}")
+           }.get(r.status_code, f"it answered {r.status_code}")
+    if r.status_code == 503:
+        try:
+            unset = r.json().get("code") == "not_configured"
+        except ValueError:
+            unset = False
+        why = ("Land Registry has no PLATFORM_KEY set: add PLATFORM_KEY to the Land Registry service (the same value as "
+               "LAND_PLATFORM_KEY here) and redeploy it" if unset else
+               "Land Registry is not running (503): it may be stopped, asleep or redeploying; try again in a few minutes")
     if r.status_code == 200:
         why = "it answered with a web page, not data: LAND_API should end in /api"
     return {"ok": False, "reason": f"Land Registry did not answer: {why}.", "status": r.status_code}
