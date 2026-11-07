@@ -449,7 +449,7 @@ def _finish_processing(index: str, band_arrays: dict, out_meta: dict,
             "png_bytes": png_bytes, "overlay_bounds": overlay_bounds,
             "stats": stats,
             "label": spec["label"],
-            "obs_date": obs_date, "source": source,
+            "obs_date": obs_date, "source": source, "index": index,
         }
 
     # persist the observation so the field builds a season timeline
@@ -614,21 +614,6 @@ def export_zones_shp(boundary_id: str, index: str, n_zones: int = 3, user=Depend
     )
 
 
-@app.get("/api/export/pdf")
-def export_pdf(boundary_id: str, index: str, user=Depends(reader)):
-    farm = _farm(user, boundary_id)
-    boundary_id, farm_name = farm["id"], farm["name"]
-    cached = _cached(boundary_id, index)
-
-    pdf_bytes = exports_mod.build_pdf_report_bytes(
-        farm_name, cached["label"], cached["stats"], overlay_png_bytes=cached["png_bytes"]
-    )
-    return StreamingResponse(
-        io.BytesIO(pdf_bytes), media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="report_{index}_{boundary_id[:8]}.pdf"'},
-    )
-
-
 # ---------------------------------------------------------------------------
 # Annotations & sharing
 # ---------------------------------------------------------------------------
@@ -766,6 +751,16 @@ def suitability_analyze(boundary_id: str = Form(...), crops: str = Form(""), pla
     return {"boundary_id": boundary_id, **result}
 
 
+def _land_check() -> dict:
+    """Not only whether LAND_API and LAND_PLATFORM_KEY are set, but whether Land Registry answers with them."""
+    t = reports_mod.title_status(9.0, 7.5)
+    if t is None:
+        return {"ok": False, "what": "LAND_API + LAND_PLATFORM_KEY not set: no title status in reports; optional"}
+    if t.get("ok"):
+        return {"ok": True, "what": f"Land Registry answers ({t['registries_searched']} registries publish a lookup)"}
+    return {"ok": False, "what": t["reason"]}
+
+
 @app.get("/api/setup", summary="What this FarmScan is connected to (for the person deploying it; no secrets)")
 def setup_check():
     """Each part FarmScan needs, and whether it is set up here: so a part that "does not work" can be traced to a
@@ -779,8 +774,7 @@ def setup_check():
         "bucket": {"ok": settings.s3_on, "what": "S3_* (the soil dataset, if HWSD is uploaded); optional"},
         "email": {"ok": mailer.configured(), "what": f"weekly alert emails: {mailer.backend()}"},
         "fires": {"ok": bool(os.environ.get("FIRMS_MAP_KEY")), "what": "FIRMS_MAP_KEY for fire alerts; optional"},
-        "land_registry": {"ok": bool(os.environ.get("LAND_API") and os.environ.get("LAND_PLATFORM_KEY")),
-                          "what": "LAND_API + LAND_PLATFORM_KEY: title status in verification reports; optional"},
+        "land_registry": _land_check(),
         "soil": {"ok": True, "what": "HWSD (installed)" if soil_mod.hwsd_installed() else "ISRIC SoilGrids (online; HWSD not installed)"},
         "sample_data": {"ok": not settings.demo_tools, "what": "DEMO_TOOLS is off (sample data hidden from customers)"},
     }
@@ -1234,6 +1228,49 @@ def _remember_licence(user: dict) -> None:
                      (user["org_id"], user["org_name"], Jsonb(user["features"]), user["licence"]))
 
 
+def _farm_alerts(f: dict, today: date_cls, wx_cache: dict, unavailable: set) -> list[dict]:
+    """This week's alerts for one farm (f: id, geojson, lat, lng). wx_cache shares weather between nearby farms."""
+    found = []
+    cell = (round(f["lat"], 1), round(f["lng"], 1))                 # one weather call per ~10 km cell
+    if cell not in wx_cache:
+        try:
+            wx = weather_mod.get_recent_and_ahead(f["lat"], f["lng"])
+            try:
+                climate = weather_mod.climate_summary(weather_mod.get_daily_history(f["lat"], f["lng"], 10))
+            except weather_mod.WeatherUnavailable:
+                climate = None
+            wx_cache[cell] = (wx, climate)
+        except weather_mod.WeatherUnavailable:
+            wx_cache[cell] = None
+    if wx_cache[cell]:
+        wx, climate = wx_cache[cell]
+        found += alerts_mod.weather_alerts(wx, alerts_mod.wet_months_of(climate), today)
+    else:
+        unavailable.add("weather")
+    try:
+        fires = alerts_mod.fetch_fires(f["geojson"])
+        if fires is None:
+            unavailable.add("fire (FIRMS_MAP_KEY not set)")
+        else:
+            found += alerts_mod.fire_alerts(fires, f["geojson"])
+    except Exception:
+        unavailable.add("fire")
+    series = {index: [o for o in monitoring_mod.list_observations(f["id"], index) if o["source"] in sources]
+              for index, sources in (("ndvi", ("live",)), ("rvi", ("sentinel-1",)))}
+    # A fall after the season's peak is the crop drying down for harvest, not a problem: only falls before the
+    # peak (or with no season read) are flagged.
+    reading = season_mod.season_reading(
+        [(o["obs_date"], o["mean"]) for o in series["ndvi"]
+         if (o["valid_fraction"] or 0) >= monitoring_mod.MIN_VALID_FRACTION and o["mean"] is not None],
+        [(o["obs_date"], o["median"]) for o in series["rvi"] if o["median"] is not None])
+    peak = (reading.get("peak") or {}).get("date") if reading.get("based_on") else None
+    drops = []
+    for index, obs in series.items():
+        if obs:
+            drops += alerts_mod.crop_alerts(monitoring_mod.analyze_trend(obs), index, today, after_peak=peak)
+    return found + drops[:1]                                   # one crop alert per farm (NDVI first, then radar)
+
+
 def org_alerts(org_id: str, today: date_cls | None = None) -> dict:
     """This week's alerts for each of the organization's farms. Each source that cannot be reached is reported, and
     the others still run."""
@@ -1245,45 +1282,7 @@ def org_alerts(org_id: str, today: date_cls | None = None) -> dict:
     wx_cache: dict = {}
     out = []
     for f in farms:
-        found = []
-        cell = (round(f["lat"], 1), round(f["lng"], 1))                 # one weather call per ~10 km cell
-        if cell not in wx_cache:
-            try:
-                wx = weather_mod.get_recent_and_ahead(f["lat"], f["lng"])
-                try:
-                    climate = weather_mod.climate_summary(weather_mod.get_daily_history(f["lat"], f["lng"], 10))
-                except weather_mod.WeatherUnavailable:
-                    climate = None
-                wx_cache[cell] = (wx, climate)
-            except weather_mod.WeatherUnavailable:
-                wx_cache[cell] = None
-        if wx_cache[cell]:
-            wx, climate = wx_cache[cell]
-            found += alerts_mod.weather_alerts(wx, alerts_mod.wet_months_of(climate), today)
-        else:
-            unavailable.add("weather")
-        try:
-            fires = alerts_mod.fetch_fires(f["geojson"])
-            if fires is None:
-                unavailable.add("fire (FIRMS_MAP_KEY not set)")
-            else:
-                found += alerts_mod.fire_alerts(fires, f["geojson"])
-        except Exception:
-            unavailable.add("fire")
-        series = {index: [o for o in monitoring_mod.list_observations(f["id"], index) if o["source"] in sources]
-                  for index, sources in (("ndvi", ("live",)), ("rvi", ("sentinel-1",)))}
-        # A fall after the season's peak is the crop drying down for harvest, not a problem: only falls before the
-        # peak (or with no season read) are flagged.
-        reading = season_mod.season_reading(
-            [(o["obs_date"], o["mean"]) for o in series["ndvi"]
-             if (o["valid_fraction"] or 0) >= monitoring_mod.MIN_VALID_FRACTION and o["mean"] is not None],
-            [(o["obs_date"], o["median"]) for o in series["rvi"] if o["median"] is not None])
-        peak = (reading.get("peak") or {}).get("date") if reading.get("based_on") else None
-        drops = []
-        for index, obs in series.items():
-            if obs:
-                drops += alerts_mod.crop_alerts(monitoring_mod.analyze_trend(obs), index, today, after_peak=peak)
-        found += drops[:1]                                      # one crop alert per farm (NDVI first, then radar)
+        found = _farm_alerts(f, today, wx_cache, unavailable)
         if found:
             out.append({"boundary_id": f["id"], "name": f["name"], "alerts": found})
     return {"farms_checked": len(farms), "farms": out, "alert_count": sum(len(x["alerts"]) for x in out),
@@ -1367,13 +1366,44 @@ def _alerts_loop(stop: threading.Event) -> None:
 # Farm verification reports
 # ---------------------------------------------------------------------------
 
-@app.post("/api/reports/verification", summary="Issue a numbered farm verification report (PDF), kept as issued")
-def issue_verification(boundary_id: str = Form(...), user=Depends(need("agronomist", write=True, feature="verification"))):
+def _health_now(farm_id: str, index: str) -> dict | None:
+    """The latest result run for the farm (map image, numbers), if one is in memory, and the timeline's last images."""
+    cached = _RESULT_CACHE.get(f"{farm_id}:{index}") or _RESULT_CACHE.get(f"{farm_id}:ndvi")
+    hist = [o for o in monitoring_mod.list_observations(farm_id, "ndvi") if o["source"] == "live" and o["mean"] is not None
+            and (o["valid_fraction"] or 0) >= monitoring_mod.MIN_VALID_FRACTION][-8:]
+    if not cached and not hist:
+        return None
+    out = {"timeline": [{"date": o["obs_date"], "mean": round(o["mean"], 3), "p10": None if o["p10"] is None else round(o["p10"], 3)}
+                        for o in hist]}
+    if cached and cached.get("source") != "demo":
+        img = Image.open(io.BytesIO(cached["png_bytes"]))
+        img.thumbnail((700, 700))
+        buf = io.BytesIO()
+        img.save(buf, "PNG", optimize=True)
+        out |= {"label": cached["label"], "obs_date": cached.get("obs_date"), "stats": cached["stats"],
+                "png_base64": base64.b64encode(buf.getvalue()).decode()}
+    return out
+
+
+def _window_words(p: dict) -> str | None:
+    """'plant from 20 May, harvest about 15 Sep' for the best window; the chosen date if one was given."""
+    w = (p.get("alternatives") or [None])[0]
+    if w:
+        return f"plant from {w['plant_from']}, harvest about {w['harvest_about']}"
+    return f"plant {p['chosen_start']}" if p.get("chosen_start") else None
+
+
+@app.post("/api/reports/farm", summary="Issue the farm report: health, season, alerts, rainfall, suitability (and title)")
+def issue_farm_report(boundary_id: str = Form(...), index: str = Form("ndvi"), user=Depends(writer)):
+    """One numbered PDF for the farm, kept as issued and checkable by anyone at /verify.html: the latest crop health
+    map (if one was run), the seasons from the satellites, this week's alerts, rainfall against normal, the crops that
+    suit the farm, and (with Farm verification reports in the plan) its land register entry."""
     farm = _farm(user, boundary_id)
     geom = shape(farm["geojson"])
     c = geom.centroid
     d = farm.get("details") or {}
     declared = d.get("declared_ha")
+    feats = set(user["features"])
     seasons, n_opt, n_rad = [], 0, 0
     nd = [o for o in monitoring_mod.list_observations(farm["id"], "ndvi") if o["source"] == "live"
           and (o["valid_fraction"] or 0) >= monitoring_mod.MIN_VALID_FRACTION and o["mean"] is not None]
@@ -1383,34 +1413,65 @@ def issue_verification(boundary_id: str = Form(...), user=Depends(need("agronomi
         ny = [(o["obs_date"], o["mean"]) for o in nd if o["obs_date"].startswith(y)]
         ry = [(o["obs_date"], o["median"]) for o in rv if o["obs_date"].startswith(y)]
         n_opt, n_rad = n_opt + len(ny), n_rad + len(ry)
-        r = season_mod.season_reading(ny, ry)
-        why = None if r["based_on"] else " ".join(x for x in (r["optical"].get("reason"), r["radar"].get("reason")) if x)
-        seasons.append({"year": int(y), "based_on": r["based_on"], "why": why,
-                        **{k: r.get(k) for k in ("planting", "greenup", "peak", "end")}})
+        r = season_mod.season_reading(ny, ry, d.get("planting_date") if str(d.get("planting_date", ""))[:4] == y else None)
+        why = r.get("note") if r.get("perennial") else (None if r["based_on"] else
+                                                         " ".join(x for x in (r["optical"].get("reason"), r["radar"].get("reason")) if x))
+        seasons.append({"year": int(y), "based_on": r["based_on"], "why": why, "confidence": r.get("confidence"),
+                        "declared_check": r.get("declared_check"), **{k: r.get(k) for k in ("planting", "greenup", "peak", "end")}})
+    hist = None
     try:
         hist = weather_mod.get_daily_history(c.y, c.x, 10)
         rain = reports_mod.rainfall(hist, weather_mod.climate_summary(hist))
     except weather_mod.WeatherUnavailable:
         rain = None
+    alerts_now = None
+    if "alerts" in feats:
+        unavailable: set = set()
+        alerts_now = {"alerts": _farm_alerts({"id": farm["id"], "geojson": farm["geojson"], "lat": c.y, "lng": c.x},
+                                             date_cls.today(), {}, unavailable), "unavailable": sorted(unavailable)}
+    suit = None
+    if "suitability" in feats and hist:
+        try:
+            a = suitability_mod.analyze(soil_mod.soil_profile(farm["geojson"]), hist, None, None, lat=c.y, lon=c.x)
+            suit = {"texture": a["soil"]["topsoil_0_30cm"].get("texture_class"),
+                    "ph": a["soil"]["topsoil_0_30cm"].get("ph_water"),
+                    "crops": [{"label": x["label"], "class": x["class"], "class_label": x["class_label"], "index": x["index"],
+                               "limit": x["limiting_factor"]["label"] if x["limiting_factor"]["significant"] else None,
+                               "window": _window_words(x["planting"])}
+                              for x in a["ranking"][:6]]}
+        except (soil_mod.SoilDataUnavailable, ValueError, KeyError):
+            suit = None
     issued_at, issued_on = reports_mod.issued_now()
     code = reports_mod.new_code()
     content = {
+        "kind": "verification" if "verification" in feats else "farm",
         "code": code, "issued_at": issued_at, "issued_on": issued_on, "org_name": user["org_name"], "issued_by": user["name"],
         "verify_url": f"{settings.app_url}/verify.html?code={code}",
         "farm": {"name": farm["name"], "area_ha": farm["area_ha"], "lat": c.y, "lng": c.x,
                  "declared_ha": declared, "declared_vs_measured_pct": round(100 * (float(declared) - farm["area_ha"]) / farm["area_ha"])
                  if declared else None, "community": d.get("community"), "lga": d.get("lga"), "state": d.get("state"),
                  "farmer": d.get("farmer_name"), "crops": d.get("crops"), "mapped_by": d.get("collected_by") if farm.get("source") == "geohub" else None},
-        "geometry": farm["geojson"], "seasons": seasons, "images": {"optical": n_opt, "radar": n_rad},
-        "rainfall": rain, "title": reports_mod.title_status(c.y, c.x),
+        "geometry": farm["geojson"], "health": _health_now(farm["id"], index), "seasons": seasons,
+        "images": {"optical": n_opt, "radar": n_rad}, "alerts": alerts_now, "rainfall": rain, "suitability": suit,
+        "title": reports_mod.title_status(c.y, c.x) if "verification" in feats else "not_in_plan",
     }
     rid = str(uuid.uuid4())
     with db.tx() as conn:
         conn.execute("INSERT INTO farm_reports (id, code, org_id, org_name, boundary_id, content, created_by) VALUES (%s, %s, %s, %s, %s, %s, %s)",
                      (rid, code, user["org_id"], user["org_name"], farm["id"], Jsonb(content), user["name"]))
-    return {"id": rid, "code": code, "pdf": f"/api/reports/{rid}/pdf", "seasons": len(seasons),
-            "warnings": [w for w, bad in (("The farm's satellite timeline is empty: build the season first.", not seasons),
-                                          ("Rainfall could not be fetched.", rain is None)) if bad]}
+    warnings = [w for w, bad in (
+        ("No crop health map: run an index on a recent image first (Health tab) to include it.", not (content["health"] or {}).get("png_base64")),
+        ("No seasons: build the season from satellite first (Season tab).", not seasons),
+        ("Rainfall could not be fetched.", rain is None),
+        ((content["title"] or {}).get("reason") or "Land Registry did not answer." if isinstance(content["title"], dict) else "",
+         isinstance(content["title"], dict) and not content["title"].get("ok"))) if bad]
+    return {"id": rid, "code": code, "pdf": f"/api/reports/{rid}/pdf", "seasons": len(seasons), "warnings": warnings}
+
+
+@app.post("/api/reports/verification", include_in_schema=False)
+def issue_verification(boundary_id: str = Form(...), user=Depends(need("agronomist", write=True, feature="verification"))):
+    """Kept for links made before the farm report: the same report."""
+    return issue_farm_report(boundary_id, "ndvi", user)
 
 
 @app.get("/api/reports", summary="The organization's verification reports (optionally for one farm)")

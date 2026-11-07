@@ -82,8 +82,11 @@ def test_search_process_every_index_and_export(sat, farm):
         assert ds.crs.to_epsg() == 32632 and ds.count == 1
     sh = client.get("/api/export/shp/zones", params={"boundary_id": farm, "index": "ndvi", "n_zones": 3})
     assert sh.status_code == 200 and any(n.endswith(".shp") for n in zipfile.ZipFile(io.BytesIO(sh.content)).namelist())
-    pdf = client.get("/api/export/pdf", params={"boundary_id": farm, "index": "ndvi"})
-    assert pdf.status_code == 200 and pdf.content[:4] == b"%PDF"
+    rep = client.post("/api/reports/farm", data={"boundary_id": farm, "index": "ndvi"})
+    assert rep.status_code == 200, rep.text
+    assert not any("crop health" in w.lower() for w in rep.json()["warnings"]), rep.json()   # the map just run is in it
+    pdf = client.get(rep.json()["pdf"])
+    assert pdf.status_code == 200 and pdf.content[:4] == b"%PDF" and len(pdf.content) > 8000
     h = client.get("/api/monitoring/history", params={"boundary_id": farm, "index": "ndvi"}).json()
     assert len(h["series"]) == 2
 

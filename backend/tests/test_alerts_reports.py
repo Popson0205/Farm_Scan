@@ -104,7 +104,8 @@ def test_verification_report(mocked, as_user):
     r = client.post("/api/reports/verification", data={"boundary_id": bid})
     assert r.status_code == 200, r.text
     rep = r.json()
-    assert rep["code"].startswith("FSV-") and rep["seasons"] == 1 and rep["warnings"] == []
+    assert rep["code"].startswith("FSV-") and rep["seasons"] == 1
+    assert [w for w in rep["warnings"] if "crop health" not in w.lower()] == []   # no index was run
     pdf = client.get(rep["pdf"])
     assert pdf.status_code == 200 and pdf.content[:4] == b"%PDF" and len(pdf.content) > 3000
     listed = client.get("/api/reports", params={"boundary_id": bid}).json()
@@ -188,3 +189,28 @@ def test_dry_down_after_the_peak_is_not_a_crop_alert():
     assert alerts.crop_alerts(trend, "ndvi", date(2026, 10, 20), after_peak="2026-08-25") == []          # drying down
     assert alerts.crop_alerts(trend, "ndvi", date(2026, 10, 20), after_peak="2026-10-15") != []          # before the peak
     assert alerts.crop_alerts(trend, "ndvi", date(2026, 10, 5)) == []                                    # not yet happened
+
+
+def test_farm_report_pdf_renders_every_section():
+    """Every section of the merged report draws, including an uncertain season, a farm with no season, alerts,
+    suitability and a land register that did not answer; and a report issued before the merge still opens."""
+    import reports
+    sq = {"type": "Polygon", "coordinates": [[[7.4, 9.07], [7.41, 9.07], [7.41, 9.08], [7.4, 9.08], [7.4, 9.07]]]}
+    base = {"code": "FSV-TEST0001", "issued_on": "2026-11-07", "org_name": "Kuje Growers", "verify_url": "https://x/verify.html?code=FSV-TEST0001",
+            "farm": {"name": "Big farm", "area_ha": 120.5, "lat": 9.075, "lng": 7.405, "declared_ha": 100, "declared_vs_measured_pct": -17,
+                     "state": "Kaduna", "farmer": "A. Musa", "crops": ["maize"]},
+            "geometry": sq, "images": {"optical": 12, "radar": 20},
+            "seasons": [{"year": 2025, "based_on": "rvi", "confidence": "low", "planting": {"from": "2025-05-01", "to": "2025-05-22"},
+                         "greenup": {"date": "2025-05-29", "plus_minus_days": 6}, "peak": {"date": "2025-08-10", "plus_minus_days": None},
+                         "end": None, "declared_check": {"words": "Green-up came long after the sowing date given", "declared": "2025-03-01"}},
+                        {"year": 2026, "based_on": None, "why": "Tree cover, bush or a perennial crop: green all year."}],
+            "rainfall": {"years": [{"year": 2025, "rain_mm": 1100, "vs_normal_pct": -8}], "normal_mm": 1200, "normal_years": "2016–2025",
+                         "wet_months": ["May", "June"], "note": "A little dry."}}
+    full = dict(base, kind="verification", health=None,
+                alerts={"alerts": [{"words": "Dry spell: 12 days without rain in the rainy season."}], "unavailable": ["fire"]},
+                suitability={"texture": "loam", "ph": 6.1, "crops": [{"label": "Maize", "class": "S2", "class_label": "moderately suitable",
+                                                                       "index": 68, "limit": "rain", "window": "May"}]},
+                title={"ok": False, "reason": "Land Registry did not answer: LAND_API should end in /api."})
+    for c in (full, dict(base, kind="farm", title="not_in_plan"), dict(base, title=None)):   # the last is an old report
+        pdf = reports.build_pdf(c)
+        assert pdf[:4] == b"%PDF" and len(pdf) > 2500
