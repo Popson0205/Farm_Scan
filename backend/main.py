@@ -5,7 +5,9 @@ import logging
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
-from datetime import date as date_cls
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from datetime import date as date_cls, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -24,15 +26,15 @@ import db
 import demo_data
 import geo
 import identity
-import plots as plots_mod
 import storage
 import zones as zones_mod
 import exports as exports_mod
-import plant_count as plant_count_mod
-import drone_ingest
 import annotations as annotations_mod
-import plot_import as plot_import_mod
 import monitoring as monitoring_mod
+import season as season_mod
+import alerts as alerts_mod
+import mailer
+import reports as reports_mod
 import soil as soil_mod
 import weather as weather_mod
 import suitability as suitability_mod
@@ -41,7 +43,6 @@ from geoestate_id import GeoEstateIDError
 from identity import Problem, current_user, need, reader, writer
 
 log = logging.getLogger("farmscan")
-MAX_UPLOAD = 1024 * 1024 * 1024          # a drone orthomosaic: up to 1 GB
 
 # In-memory cache of the last computed index result per (boundary_id, index), so plot stats / zones / exports can
 # reuse the raster instead of recomputing. Farm ids are checked against the person's organization before use.
@@ -51,12 +52,18 @@ _RESULT_CACHE: dict[str, dict] = {}
 @asynccontextmanager
 async def lifespan(_app):
     db.start()
+    with db.tx() as conn:                            # jobs cut short by a restart
+        conn.execute("UPDATE season_jobs SET status = 'failed', message = 'FarmScan restarted while this ran: start it again.', "
+                     "finished_at = now() WHERE status IN ('queued', 'running')")
     soil_mod.fetch_from_bucket()
+    stop = threading.Event()
+    threading.Thread(target=_alerts_loop, args=(stop,), daemon=True, name="weekly-alerts").start()
     yield
+    stop.set()
     db.pool.close()
 
 
-app = FastAPI(title="FarmScan API", description="Satellite and drone farm health mapping, on the GeoEstate platform",
+app = FastAPI(title="FarmScan API", description="Satellite farm health mapping, on the GeoEstate platform",
               lifespan=lifespan)
 
 
@@ -78,7 +85,7 @@ def _uuid(v: str, what: str = "Farm") -> str:
 def _farm(user: dict, boundary_id: str, conn=None) -> dict:
     """The farm, if it belongs to the person's organization (404 otherwise, as if it did not exist)."""
     bid = _uuid(boundary_id)
-    sql = ("SELECT id::text AS id, name, geojson, area_ha, created_by, created_at::text AS created_at FROM boundaries "
+    sql = ("SELECT id::text AS id, name, geojson, area_ha, created_by, created_at::text AS created_at, details, source FROM boundaries "
            "WHERE id = %s AND org_id = %s")
     if conn is not None:
         row = conn.execute(sql, (bid, user["org_id"])).fetchone()
@@ -162,6 +169,7 @@ def sign_out(request: Request):
 
 @app.get("/api/me", summary="Who is signed in, their role, the plan's features and hectares used")
 def me(user=Depends(current_user)):
+    _remember_licence(user)
     with db.tx() as conn:
         used = conn.execute("SELECT coalesce(sum(area_ha), 0) AS ha, count(*) AS farms FROM boundaries WHERE org_id = %s",
                             (user["org_id"],)).fetchone()
@@ -220,13 +228,14 @@ def create_boundary(name: str = Form(...), geojson: str = Form(...), user=Depend
 def get_boundary(boundary_id: str, user=Depends(reader)):
     row = _farm(user, boundary_id)
     return {"boundary_id": row["id"], "name": row["name"], "geojson": row["geojson"], "area_ha": row["area_ha"],
-            "created_by": row["created_by"], "created_at": row["created_at"]}
+            "created_by": row["created_by"], "created_at": row["created_at"], "details": row["details"], "source": row["source"]}
 
 
 @app.get("/api/boundaries")
 def list_boundaries(user=Depends(reader)):
     with db.tx() as conn:
-        return conn.execute("SELECT id::text AS id, name, area_ha, created_by, created_at::text AS created_at FROM boundaries "
+        return conn.execute("SELECT id::text AS id, name, area_ha, created_by, created_at::text AS created_at, source, "
+                            "details->>'farmer_name' AS farmer FROM boundaries "
                             "WHERE org_id = %s ORDER BY created_at DESC", (user["org_id"],)).fetchall()
 
 
@@ -446,231 +455,12 @@ def _finish_processing(index: str, band_arrays: dict, out_meta: dict,
     })
 
 
-# ---------------------------------------------------------------------------
-# Plot layout (regular grid, manual editing, SHP/KML import)
-# ---------------------------------------------------------------------------
-
-@app.post("/api/plots/generate-grid")
-def generate_grid_plots(boundary_id: str = Form(...), rows: int = Form(None), cols: int = Form(None),
-                        target_plot_count: int = Form(None), user=Depends(writer)):
-    """Manual/regular grid plot layout: splits the farm boundary into a rows x cols
-    grid of evenly-sized trial plots. Use this when you want a uniform layout
-    regardless of what's actually visible in imagery (e.g. planning plots before
-    planting). Plots that already exist elsewhere (QGIS, a trial-management
-    system) can be brought in with /api/plots/import, and any plot can be
-    adjusted with the edit/add/delete endpoints. Provide either rows+cols
-    directly, or target_plot_count to auto-estimate a grid."""
-    farm = _farm(user, boundary_id)
-    boundary_id, boundary_geojson = farm["id"], farm["geojson"]
-
-    if rows is None or cols is None:
-        if target_plot_count is None:
-            raise HTTPException(400, "Provide either rows+cols or target_plot_count")
-        rows, cols = plots_mod.estimate_grid_from_plot_count(boundary_geojson, target_plot_count)
-
-    if not (1 <= rows <= 200 and 1 <= cols <= 200):
-        raise HTTPException(400, "Rows and columns must each be between 1 and 200")
-    plot_list = plots_mod.generate_grid_plots(boundary_geojson, rows, cols)
-    _replace_plots(boundary_id, plot_list)
-
-    return {"rows": rows, "cols": cols, "plot_count": len(plot_list), "plots": plot_list}
-
-
-def _replace_plots(boundary_id: str, plot_list: list[dict]) -> None:
-    """Replace a farm's plots with a new set (grid or import)."""
-    with db.tx() as conn:
-        conn.execute("DELETE FROM plots WHERE boundary_id = %s", (boundary_id,))
-        with conn.cursor() as cur:
-            cur.executemany(
-                "INSERT INTO plots (id, boundary_id, plot_id, row_idx, col_idx, geojson, area_m2) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                [(str(uuid.uuid4()), boundary_id, p["plot_id"], p["row"], p["col"], Jsonb(p["geometry"]), p["area_m2"])
-                 for p in plot_list])
-
-
-def _plot_rows(boundary_id: str) -> list[dict]:
-    with db.tx() as conn:
-        return conn.execute("SELECT plot_id, row_idx, col_idx, geojson, area_m2 FROM plots WHERE boundary_id = %s "
-                            "ORDER BY plot_id", (boundary_id,)).fetchall()
-
-
-@app.get("/api/plots/{boundary_id}")
-def get_plots(boundary_id: str, user=Depends(reader)):
-    rows = _plot_rows(_farm(user, boundary_id)["id"])
-    return {
-        "plot_count": len(rows),
-        "plots": [{"plot_id": r["plot_id"], "row": r["row_idx"], "col": r["col_idx"], "geometry": r["geojson"],
-                   "area_m2": r["area_m2"]} for r in rows],
-    }
-
-
-@app.post("/api/plots/{boundary_id}/edit")
-def edit_plot(boundary_id: str, plot_id: int = Form(...), geojson: str = Form(...), user=Depends(writer)):
-    """
-    Advanced plot editing: replaces a single plot's geometry (e.g. after the user
-    drags/reshapes it on the map) without regenerating the whole set. row/col
-    labels are kept as-is; area_m2 is recomputed from the new geometry.
-    """
-    new_geom, area_m2 = _plot_geometry(geojson)
-    with db.tx() as conn:
-        bid = _farm(user, boundary_id, conn)["id"]
-        done = conn.execute("UPDATE plots SET geojson = %s, area_m2 = %s WHERE boundary_id = %s AND plot_id = %s",
-                            (Jsonb(new_geom), area_m2, bid, plot_id)).rowcount
-    if not done:
-        raise HTTPException(404, "Plot not found for this farm")
-    return {"plot_id": plot_id, "geometry": new_geom, "area_m2": area_m2}
-
-
-def _plot_geometry(geojson: str) -> tuple[dict, float]:
-    try:
-        new_geom = json.loads(geojson)
-    except json.JSONDecodeError:
-        raise HTTPException(400, "Invalid JSON in geojson field")
-    if not isinstance(new_geom, dict) or new_geom.get("type") not in ("Polygon", "MultiPolygon"):
-        raise HTTPException(400, "A plot must be a Polygon or MultiPolygon")
-    return new_geom, round(geo.area_m2(_valid_shape(new_geom)), 2)
-
-
-@app.post("/api/plots/{boundary_id}/add")
-def add_plot(boundary_id: str, geojson: str = Form(...), row: int = Form(None), col: int = Form(None),
-             user=Depends(writer)):
-    """Advanced plot editing: manually adds one new plot (e.g. one the grid missed). Assigns the next plot_id."""
-    new_geom, area_m2 = _plot_geometry(geojson)
-    with db.tx() as conn:
-        bid = _farm(user, boundary_id, conn)["id"]
-        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (bid,))
-        m = conn.execute("SELECT max(plot_id) AS m FROM plots WHERE boundary_id = %s", (bid,)).fetchone()["m"]
-        next_plot_id = 0 if m is None else m + 1
-        conn.execute("INSERT INTO plots (id, boundary_id, plot_id, row_idx, col_idx, geojson, area_m2) "
-                     "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                     (str(uuid.uuid4()), bid, next_plot_id, row, col, Jsonb(new_geom), area_m2))
-    return {"plot_id": next_plot_id, "row": row, "col": col, "geometry": new_geom, "area_m2": area_m2}
-
-
-@app.delete("/api/plots/{boundary_id}/{plot_id}")
-def delete_plot(boundary_id: str, plot_id: int, user=Depends(writer)):
-    """Advanced plot editing: removes a single plot (e.g. an edge plot that isn't part of the trial)."""
-    with db.tx() as conn:
-        bid = _farm(user, boundary_id, conn)["id"]
-        done = conn.execute("DELETE FROM plots WHERE boundary_id = %s AND plot_id = %s", (bid, plot_id)).rowcount
-    if not done:
-        raise HTTPException(404, "Plot not found for this farm")
-    return {"deleted": True, "plot_id": plot_id}
-
-
-@app.post("/api/plots/import")
-async def import_plots(boundary_id: str = Form(...), file: UploadFile = File(...), user=Depends(writer)):
-    """
-    Import existing plots from a SHP (zipped shapefile: .shp/.shx/.dbf/.prj) or
-    KML file, replacing any current plots for this boundary — for trials where
-    plot boundaries were already digitized elsewhere (e.g. in QGIS or a trial
-    management system) rather than drawn in FarmScan.
-    """
-    boundary_id = _farm(user, boundary_id)["id"]
-
-    filename = file.filename or ""
-    suffix = Path(filename).suffix.lower()
-    if suffix not in (".zip", ".kml", ".shp"):
-        raise HTTPException(400, "Upload a zipped shapefile (.zip), a bare .shp, or a .kml file")
-
-    content = await file.read(50 * 1024 * 1024 + 1)
-    if len(content) > 50 * 1024 * 1024:
-        raise HTTPException(413, "The plot file is over 50 MB")
-    try:
-        plot_list = plot_import_mod.parse_plots_file(content, suffix)
-    except Exception as e:
-        raise HTTPException(400, f"Could not read plot file: {e}")
-
-    if not plot_list:
-        raise HTTPException(400, "No polygon features found in the uploaded file")
-
-    _replace_plots(boundary_id, plot_list)
-    return {"plot_count": len(plot_list), "plots": plot_list, "source": f"imported_{suffix.lstrip('.')}"}
-
-
-def _compute_plot_stats(boundary_id: str, index: str) -> dict:
-    """Per-plot statistics for an already-processed index (Solvi's 'extensive
-    statistics for each plot in a single click'). Requires plots to have been
-    generated via /api/plots/generate-grid and the index processed already."""
-    cached = _cached(boundary_id, index)
-    plot_rows = _plot_rows(boundary_id)
-    if not plot_rows:
-        raise HTTPException(400, "This farm has no plots yet — generate a grid, draw or import plots first.")
-
-    idx_array = cached["array"]
-    transform = cached["transform"]
-    crs = cached["crs"]
-
-    # build an in-memory single-band raster so we can rasterio.mask clip per plot
-    profile = {
-        "driver": "GTiff", "dtype": "float32", "nodata": np.nan,
-        "width": idx_array.shape[1], "height": idx_array.shape[0],
-        "count": 1, "crs": crs, "transform": transform,
-    }
-
-    results = []
-    no_data_count = 0
-    with rasterio.io.MemoryFile() as memfile:
-        with memfile.open(**profile) as ds:
-            ds.write(idx_array.astype(np.float32), 1)
-
-        with memfile.open() as ds:
-            for p in plot_rows:
-                plot_geom = p["geojson"]
-                reason = None
-                try:
-                    clipped, _ = rio_mask(ds, [plot_geom], crop=True, nodata=np.nan)
-                    plot_arr = clipped[0]
-                    valid_mask = ~np.isnan(plot_arr)
-                    stats = zonal_stats(plot_arr, valid_mask)
-                    if stats["mean"] is None:
-                        reason = ("Plot falls outside the processed boundary shape (inside its "
-                                   "bounding box, but outside the polygon) — redraw the boundary "
-                                   "to fully cover this plot, or re-run the index.")
-                except Exception as e:
-                    stats = {"mean": None, "min": None, "max": None, "std": None, "pixel_count": 0}
-                    reason = f"Could not clip this plot against the processed raster ({e})"
-
-                if reason:
-                    no_data_count += 1
-
-                results.append({
-                    "plot_id": p["plot_id"], "row": p["row_idx"], "col": p["col_idx"],
-                    "area_m2": p["area_m2"], **stats, "no_data_reason": reason,
-                })
-
-    return {
-        "index": index, "plot_count": len(results), "plots": results,
-        "no_data_count": no_data_count,
-    }
-
-
-
-
 def _cached(boundary_id: str, index: str) -> dict:
     cached = _RESULT_CACHE.get(f"{boundary_id}:{index}")
     if not cached:
         raise HTTPException(400, f"No processed '{index}' result for this farm — run the index first.")
     return cached
 
-
-@app.post("/api/plots/zonal-stats")
-def plots_zonal_stats(boundary_id: str = Form(...), index: str = Form(...), user=Depends(reader)):
-    """Per-plot statistics for an already-processed index (mean/min/max/std/pixel_count per
-    plot). Requires plots (generate-grid / import) and the index processed first."""
-    return _compute_plot_stats(_farm(user, boundary_id)["id"], index)
-
-
-@app.post("/api/plots/performance")
-def plots_performance(boundary_id: str = Form(...), index: str = Form(...), user=Depends(reader)):
-    """Ranks plots against the field baseline (z-score vs median plot), flags
-    underperforming / watch plots, and reports field uniformity and the headroom between
-    the median plot and the top quartile. Uses the cached index raster."""
-    stats = _compute_plot_stats(_farm(user, boundary_id)["id"], index)
-    try:
-        ranked = monitoring_mod.rank_plots(stats["plots"])
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    return {"index": index, **ranked}
 
 
 # ---------------------------------------------------------------------------
@@ -780,25 +570,6 @@ def export_geotiff(boundary_id: str, index: str, user=Depends(reader)):
     )
 
 
-@app.get("/api/export/shp/plots")
-def export_plots_shp(boundary_id: str, user=Depends(reader)):
-    boundary_id = _farm(user, boundary_id)["id"]
-    rows = _plot_rows(boundary_id)
-    if not rows:
-        raise HTTPException(400, "This farm has no plots yet.")
-
-    features = [
-        {"geometry": r["geojson"], "plot_id": r["plot_id"],
-         "row": r["row_idx"], "col": r["col_idx"], "area_m2": r["area_m2"]}
-        for r in rows
-    ]
-    zip_bytes = exports_mod.geometries_to_shapefile_zip_bytes(features, layer_name="plots")
-    return StreamingResponse(
-        io.BytesIO(zip_bytes), media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="plots_{boundary_id[:8]}.zip"'},
-    )
-
-
 @app.get("/api/export/shp/zones")
 def export_zones_shp(boundary_id: str, index: str, n_zones: int = 3, user=Depends(need(feature="zones"))):
     boundary_id = _farm(user, boundary_id)["id"]
@@ -820,138 +591,19 @@ def export_zones_shp(boundary_id: str, index: str, n_zones: int = 3, user=Depend
     )
 
 
-@app.get("/api/export/excel/plots")
-def export_plots_excel(boundary_id: str, index: str, user=Depends(reader)):
-    """Re-runs the same zonal-stats logic as /api/plots/zonal-stats and returns it as .xlsx."""
-    boundary_id = _farm(user, boundary_id)["id"]
-    resp = _compute_plot_stats(boundary_id, index)
-    plot_stats = resp["plots"]
-    xlsx_bytes = exports_mod.plot_stats_to_excel_bytes(plot_stats, sheet_title=f"{index.upper()} Plot Stats")
-    return StreamingResponse(
-        io.BytesIO(xlsx_bytes),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="plot_stats_{index}_{boundary_id[:8]}.xlsx"'},
-    )
-
-
 @app.get("/api/export/pdf")
 def export_pdf(boundary_id: str, index: str, user=Depends(reader)):
     farm = _farm(user, boundary_id)
     boundary_id, farm_name = farm["id"], farm["name"]
     cached = _cached(boundary_id, index)
-    plot_count = len(_plot_rows(boundary_id))
 
     pdf_bytes = exports_mod.build_pdf_report_bytes(
-        farm_name, cached["label"], cached["stats"], plot_count, overlay_png_bytes=cached["png_bytes"]
+        farm_name, cached["label"], cached["stats"], overlay_png_bytes=cached["png_bytes"]
     )
     return StreamingResponse(
         io.BytesIO(pdf_bytes), media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="report_{index}_{boundary_id[:8]}.pdf"'},
     )
-
-
-# ---------------------------------------------------------------------------
-# Drone orthomosaic upload + plant counting
-# ---------------------------------------------------------------------------
-
-@app.post("/api/drone/upload")
-async def upload_drone_image(file: UploadFile = File(...), user=Depends(need("agronomist", write=True, feature="drone"))):
-    """Upload a stitched drone orthomosaic GeoTIFF (Pix4D/Agisoft/DroneDeploy/OpenDroneMap output). Kept in the
-    platform bucket for the organization. Returns metadata so the person can confirm the bands before running plant
-    counts on it."""
-    if not (file.filename or "").lower().endswith((".tif", ".tiff")):
-        raise HTTPException(400, "Please upload a GeoTIFF (.tif/.tiff) orthomosaic")
-    file_id = str(uuid.uuid4())
-    tmp = Path(tempfile.mkdtemp(prefix="farm-drone-")) / f"{file_id}.tif"
-    size = 0
-    with open(tmp, "wb") as f:
-        while chunk := await file.read(8 * 1024 * 1024):
-            size += len(chunk)
-            if size > MAX_UPLOAD:
-                tmp.unlink(missing_ok=True)
-                raise HTTPException(413, "The orthomosaic is over 1 GB. Export it at a coarser resolution (2–5 cm/pixel is enough).")
-            f.write(chunk)
-    try:
-        meta = drone_ingest.inspect_orthomosaic(str(tmp))
-        preview = drone_ingest.generate_preview(str(tmp))
-    except Exception as e:
-        tmp.unlink(missing_ok=True)
-        raise HTTPException(400, f"Could not read file as GeoTIFF: {e}")
-    k = storage.key("orgs", user["org_id"], "drone", f"{file_id}.tif")
-    storage.put_file(tmp, k, "image/tiff")
-    with db.tx() as conn:
-        conn.execute("INSERT INTO drone_files (id, org_id, filename, storage_key, size_bytes, uploaded_by) "
-                     "VALUES (%s, %s, %s, %s, %s, %s)", (file_id, user["org_id"], file.filename[:200], k, size, user["name"]))
-    return {"drone_file_id": file_id, **meta, **preview}
-
-
-def _drone_file(user: dict, drone_file_id: str) -> str:
-    """A local copy of one of the organization's orthomosaics."""
-    with db.tx() as conn:
-        row = conn.execute("SELECT storage_key FROM drone_files WHERE id = %s AND org_id = %s",
-                           (_uuid(drone_file_id, "Drone file"), user["org_id"])).fetchone()
-    path = storage.local_path(row["storage_key"]) if row else None
-    if not path:
-        raise HTTPException(404, "Uploaded drone file not found — upload the orthomosaic again.")
-    return str(path)
-
-
-@app.post("/api/drone/plant-count")
-def drone_plant_count(drone_file_id: str = Form(...), boundary_id: str = Form(None), min_plant_area_px: int = Form(15),
-                      user=Depends(need(feature="plant_count"))):
-    """
-    Runs blob/watershed-based plant detection on an uploaded drone orthomosaic.
-    Requires centimeter-scale imagery — will not work meaningfully on satellite data.
-    See plant_count.py docstring for accuracy caveats (baseline method, not a
-    trained model — best on widely-spaced row/nursery crops).
-    """
-    file_path = _drone_file(user, drone_file_id)
-    boundary_geojson = _farm(user, boundary_id)["geojson"] if boundary_id else None
-
-    rgb, meta = drone_ingest.load_rgb_for_plant_count(file_path, boundary_geojson)
-    result = plant_count_mod.count_plants(rgb, min_plant_area_px=min_plant_area_px)
-    geo_points = plant_count_mod.pixel_centroids_to_geojson_points(
-        result["centroids_px"], result["areas_px"], meta["transform"], meta["crs"]
-    )
-
-    return {
-        "plant_count": result["count"],
-        "mean_canopy_area_px": result["mean_canopy_area_px"],
-        "plants": geo_points,
-        "note": "Baseline blob/watershed detector — best accuracy on widely-spaced row or "
-                "nursery crops with cm-resolution imagery. For dense closed-canopy fields, "
-                "accuracy will be lower without a crop-specific trained model.",
-    }
-
-
-@app.post("/api/drone/plant-count-per-plot")
-def drone_plant_count_per_plot(drone_file_id: str = Form(...), boundary_id: str = Form(...),
-                               min_plant_area_px: int = Form(15), user=Depends(need(feature="plant_count"))):
-    """
-    Plant counts broken down per plot, rather than one field-wide total. Requires plots to already exist for this
-    farm (from a grid, drawing or import).
-    """
-    file_path = _drone_file(user, drone_file_id)
-    farm = _farm(user, boundary_id)
-    plot_rows = _plot_rows(farm["id"])
-    if not plot_rows:
-        raise HTTPException(400, "This farm has no plots yet — generate a grid, draw or import plots first.")
-    plots = [{"plot_id": r["plot_id"], "row": r["row_idx"], "col": r["col_idx"], "geometry": r["geojson"]}
-             for r in plot_rows]
-
-    rgb, meta = drone_ingest.load_rgb_for_plant_count(file_path, farm["geojson"])
-    result = plant_count_mod.count_plants(rgb, min_plant_area_px=min_plant_area_px)
-    geo_points = plant_count_mod.pixel_centroids_to_geojson_points(
-        result["centroids_px"], result["areas_px"], meta["transform"], meta["crs"]
-    )
-    per_plot = plant_count_mod.aggregate_plants_per_plot(geo_points, plots)
-
-    return {
-        "boundary_id": farm["id"],
-        "total_plant_count": result["count"],
-        "plot_count": len(per_plot),
-        "plots": per_plot,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -1090,6 +742,651 @@ def health():
     with db.tx() as conn:
         conn.execute("SELECT 1")
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Many farms: the organization's portfolio, farms from Geohub, scouting tasks to Geohub
+# ---------------------------------------------------------------------------
+
+def _geohub_token(request: Request) -> str:
+    token = getattr(request.state, "at", None) or request.cookies.get(identity.AT)
+    if not token:
+        raise Problem(401, "Sign in again to reach Geohub.", code="unauthenticated")
+    return token
+
+
+def _geohub(request: Request, path: str, params: dict | None = None):
+    """Geohub's field data, read as the person (only what they could open in Geohub)."""
+    try:
+        return identity.client().data(_geohub_token(request), path, params)
+    except GeoEstateIDError as e:
+        if e.status in (401, 403, 404):
+            raise Problem(e.status if e.status != 401 else 403, str(e), code=e.code or "geohub")
+        raise Problem(502, f"Geohub could not be reached ({e}). Try again in a minute.", code="geohub_unreachable")
+
+
+def _geohub_forms(request: Request, template: str) -> list[dict]:
+    out = []
+    for p in _geohub(request, "projects"):
+        for f in p.get("forms", []):
+            if f.get("template") == template:
+                out.append({"form_id": str(f["id"]), "name": f["name"], "project_id": str(p["id"]), "project_name": p["name"],
+                            "features": f.get("features", 0)})
+    return out
+
+
+def _all_features(request: Request, form_id: str) -> list[dict]:
+    rows, after = [], 0
+    while True:
+        page = _geohub(request, f"forms/{form_id}/features", {"after": after, "limit": 1000})
+        rows += page["features"]
+        if not page.get("next"):
+            return rows
+        after = page["next"]
+
+
+@app.get("/api/portfolio", summary="Every farm of the organization with its latest health, alerts and open scouting tasks")
+def portfolio(index: str = "ndvi", user=Depends(reader)):
+    """Ranked weakest first: farms whose latest image shows a drop (alert) first, then by the latest mean value. Farms
+    with no usable image yet come last. Sample data counts only where DEMO_TOOLS is on."""
+    if index not in INDEX_REGISTRY:
+        raise HTTPException(400, f"Unknown index '{index}'")
+    with db.tx() as conn:
+        farms = conn.execute(
+            "SELECT b.id::text AS id, b.name, b.area_ha, b.details, b.source, ST_Y(ST_Centroid(b.geom)) AS lat, "
+            "  ST_X(ST_Centroid(b.geom)) AS lng, ST_AsGeoJSON(ST_SimplifyPreserveTopology(b.geom, 0.00002), 6)::jsonb AS geometry, "
+            "  (SELECT count(*) FROM scouting_tasks t WHERE t.boundary_id = b.id AND t.status = 'open') AS open_tasks "
+            "FROM boundaries b WHERE b.org_id = %s ORDER BY b.created_at", (user["org_id"],)).fetchall()
+        obs = conn.execute(
+            "SELECT o.boundary_id::text AS boundary_id, o.index_name, o.obs_date, o.source, o.scene_id, o.cloud_cover, "
+            "  o.valid_fraction, o.mean, o.median, o.std, o.p10, o.p90, o.pixel_count FROM observations o "
+            "JOIN boundaries b ON b.id = o.boundary_id WHERE b.org_id = %s AND o.index_name = %s"
+            + ("" if settings.demo_tools else " AND o.source <> 'demo'") + " ORDER BY o.obs_date",
+            (user["org_id"], index)).fetchall()
+    by_farm: dict[str, list] = {}
+    for o in obs:
+        by_farm.setdefault(o["boundary_id"], []).append(o)
+    out = []
+    for f in farms:
+        t = monitoring_mod.analyze_trend(by_farm.get(f["id"], []))
+        usable = [s for s in t["series"] if s["usable"]]
+        last = usable[-1] if usable else None
+        d = f["details"] or {}
+        out.append({
+            "id": f["id"], "name": f["name"], "area_ha": f["area_ha"], "source": f["source"], "lat": f["lat"], "lng": f["lng"],
+            "geometry": f["geometry"], "farmer": d.get("farmer_name"), "community": d.get("community"), "crops": d.get("crops") or [],
+            "latest": last and {"obs_date": last["obs_date"], "mean": round(last["mean"], 3), "source": last["source"],
+                                "change_vs_prev": None if last["change_vs_prev"] is None else round(last["change_vs_prev"], 3)},
+            "images": len(usable), "status": t["status"], "alert": bool(last and last.get("alert")),
+            "alerts": len(t["alerts"]), "open_tasks": f["open_tasks"],
+        })
+    out.sort(key=lambda r: (r["latest"] is None, not r["alert"], r["latest"]["mean"] if r["latest"] else 0))
+    for i, r in enumerate(out, 1):
+        r["rank"] = i
+    return {"index": index, "farms": out, "farm_count": len(out), "hectares": round(sum(r["area_ha"] for r in out), 2),
+            "with_alerts": sum(1 for r in out if r["alert"]), "without_images": sum(1 for r in out if not r["latest"])}
+
+
+@app.get("/api/geohub/forms", summary="The person's Geohub forms made from a FarmScan template")
+def geohub_forms(request: Request, template: str, user=Depends(reader)):
+    if template not in ("farm_enumeration", "farm_scouting"):
+        raise HTTPException(400, "template is farm_enumeration or farm_scouting")
+    return _geohub_forms(request, template)
+
+
+FARMER_KEYS = ("farmer_name", "farmer_phone", "farmer_gender", "farmer_group", "community", "lga", "state", "crops",
+               "planting_date", "declared_ha", "tenure", "water", "farm_name", "remarks")
+
+
+@app.post("/api/enumeration/import", summary="Bring in the farms a field team mapped with a Geohub \"Farm enumeration\" form")
+def import_enumerated_farms(request: Request, form_id: str = Form(...), user=Depends(writer)):
+    """Each submitted or approved record with an area becomes a farm, with its farmer's details (records already
+    brought in are skipped, so it can be run again as more come in). Drafts and records a reviewer sent back are left
+    out. The plan's hectares apply: farms that would go over are reported, not added."""
+    form_id = _uuid(form_id, "Form")
+    form = next((f for f in _geohub_forms(request, "farm_enumeration") if f["form_id"] == form_id), None)
+    if not form:
+        raise Problem(404, "That Geohub form is not a Farm enumeration form you can open.", code="not_found")
+    feats = _all_features(request, form_id)
+    added, skipped, problems = [], 0, []
+    limit = (user["limits"] or {}).get("hectares")
+    with db.tx() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (user["org_id"],))
+        used = conn.execute("SELECT coalesce(sum(area_ha), 0) AS ha FROM boundaries WHERE org_id = %s", (user["org_id"],)).fetchone()["ha"]
+        have = {r["source_feature"] for r in conn.execute(
+            "SELECT source_feature::text AS source_feature FROM boundaries WHERE org_id = %s AND source_feature IS NOT NULL",
+            (user["org_id"],)).fetchall()}
+        for ft in feats:
+            fid = str(ft["id"])
+            if ft.get("status") not in ("submitted", "approved"):
+                continue
+            if fid in have:
+                skipped += 1
+                continue
+            p = ft.get("properties") or {}
+            label = p.get("farm_name") or (f"{p['farmer_name']}'s farm" if p.get("farmer_name") else f"Farm {ft.get('seq')}")
+            g = ft.get("geometry") or {}
+            if g.get("type") not in ("Polygon", "MultiPolygon"):
+                problems.append({"record": ft.get("seq"), "farm": label, "problem": "has no area (not a walked boundary)"})
+                continue
+            try:
+                geom = _valid_shape(g)
+            except HTTPException:
+                problems.append({"record": ft.get("seq"), "farm": label, "problem": "its boundary crosses itself; fix it in Geohub"})
+                continue
+            area_ha = round(geo.area_m2(geom) / 10000, 2)
+            if limit is not None and used + area_ha > limit:
+                problems.append({"record": ft.get("seq"), "farm": label,
+                                 "problem": f"{area_ha:,.2f} ha would go over the plan's {limit:,} ha"})
+                continue
+            details = {k: p[k] for k in FARMER_KEYS if p.get(k) not in (None, "", [])}
+            details |= {"collected_by": ft.get("created_by_name"), "geohub_record": ft.get("seq"), "geohub_form": form["name"]}
+            if community := p.get("community"):
+                label = f"{label}, {community}" if community not in label else label
+            bid = str(uuid.uuid4())
+            conn.execute("INSERT INTO boundaries (id, org_id, name, geojson, area_ha, created_by, details, source, source_feature, "
+                         "source_form) VALUES (%s, %s, %s, %s, %s, %s, %s, 'geohub', %s, %s)",
+                         (bid, user["org_id"], label[:200], Jsonb(g), area_ha, user["name"], Jsonb(details), fid, form_id))
+            used += area_ha
+            added.append({"boundary_id": bid, "name": label, "area_ha": area_ha})
+    return {"form": form["name"], "added": added, "already_here": skipped, "problems": problems,
+            "hectares_used": round(used, 2), "hectares_limit": limit}
+
+
+@app.get("/api/settings")
+def get_settings(user=Depends(reader)):
+    with db.tx() as conn:
+        row = conn.execute("SELECT scouting_form::text AS scouting_form, scouting_project::text AS scouting_project, "
+                           "scouting_form_name, updated_by, updated_at::text AS updated_at FROM org_settings WHERE org_id = %s",
+                           (user["org_id"],)).fetchone()
+    return row or {"scouting_form": None, "scouting_project": None, "scouting_form_name": None}
+
+
+@app.put("/api/settings/scouting", summary="The Geohub form (made from the Farm scouting template) scouts answer in")
+def set_scouting_form(request: Request, form_id: str = Form(...), user=Depends(need("manager", write=True, feature="monitoring"))):
+    form_id = _uuid(form_id, "Form")
+    form = next((f for f in _geohub_forms(request, "farm_scouting") if f["form_id"] == form_id), None)
+    if not form:
+        raise Problem(404, "That Geohub form is not a Farm scouting form you can open.", code="not_found")
+    with db.tx() as conn:
+        conn.execute("INSERT INTO org_settings (org_id, scouting_form, scouting_project, scouting_form_name, updated_by) "
+                     "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (org_id) DO UPDATE SET scouting_form = EXCLUDED.scouting_form, "
+                     "scouting_project = EXCLUDED.scouting_project, scouting_form_name = EXCLUDED.scouting_form_name, "
+                     "updated_by = EXCLUDED.updated_by, updated_at = now()",
+                     (user["org_id"], form_id, form["project_id"], f"{form['name']} ({form['project_name']})", user["name"]))
+    return get_settings(user)
+
+
+def _task_link(project: str, form: str, farm: str, ref: str, seen: str, lat: float, lng: float) -> str:
+    fill = base64.urlsafe_b64encode(json.dumps({"farm": farm, "task_ref": ref, "seen": seen}, ensure_ascii=False)
+                                    .encode()).decode().rstrip("=")
+    return f"{settings.geohub_url}/collect/{project}?form={form}&fill={fill}&at={lat:.6f},{lng:.6f}"
+
+
+TASK_SQL = ("SELECT id::text AS id, ref, rank, lat, lng, area_m2, index_name, obs_date, seen, status, link, findings, "
+            "found_at::text AS found_at, created_by, created_at::text AS created_at FROM scouting_tasks ")
+
+
+@app.post("/api/scouting/tasks", summary="Send the farm's problem areas to scouts: one Geohub link per area")
+def send_to_scouts(boundary_id: str = Form(...), index: str = Form("ndvi"), sensitivity: float = Form(1.5),
+                   min_area_m2: float = Form(400.0), user=Depends(need("agronomist", write=True, feature="monitoring"))):
+    """Finds the problem areas in the last processed image (as Find problem areas does) and makes a scouting task for
+    each, replacing this farm's tasks still open. Each task has a link that opens the organization's Geohub scouting
+    form with the farm, the task and what the satellite saw filled in, and the place marked; send the links to scouts
+    (WhatsApp, SMS). Their answers come back with "Check scouts' answers"."""
+    farm = _farm(user, boundary_id)
+    with db.tx() as conn:
+        st = conn.execute("SELECT scouting_form::text AS f, scouting_project::text AS p FROM org_settings WHERE org_id = %s",
+                          (user["org_id"],)).fetchone()
+    if not st or not st["f"]:
+        raise Problem(409, "Choose your organization's Geohub scouting form first (a form made from the Farm scouting "
+                           "template). A manager sets it once.", code="no_scouting_form")
+    cached = _cached(farm["id"], index)
+    try:
+        result = monitoring_mod.find_problem_areas(cached["array"], cached["transform"], cached["crs"], index,
+                                                   sensitivity=sensitivity, min_area_m2=min_area_m2)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    obs_date = cached.get("obs_date") or ""
+    tasks = []
+    with db.tx() as conn:
+        conn.execute("UPDATE scouting_tasks SET status = 'cancelled' WHERE boundary_id = %s AND status = 'open'", (farm["id"],))
+        for a in result["areas"]:
+            tid = uuid.uuid4()
+            ref = f"FS-{tid.hex[:6].upper()}"
+            seen = monitoring_mod.scouting_note_text(a, index, obs_date)
+            lat, lng = a["centroid"]["lat"], a["centroid"]["lng"]
+            link = _task_link(st["p"], st["f"], farm["name"], ref, seen, lat, lng)
+            conn.execute("INSERT INTO scouting_tasks (id, boundary_id, ref, rank, lat, lng, area_m2, index_name, obs_date, seen, link, "
+                         "created_by) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                         (str(tid), farm["id"], ref, a["rank"], lat, lng, a.get("area_m2"), index, obs_date, seen, link,
+                          user["name"]))
+        tasks = conn.execute(TASK_SQL + "WHERE boundary_id = %s AND status = 'open' ORDER BY rank", (farm["id"],)).fetchall()
+    return {"farm": farm["name"], "obs_date": obs_date, "tasks": tasks, "summary": result["summary"],
+            "message": _whatsapp_text(farm["name"], tasks)}
+
+
+def _whatsapp_text(farm: str, tasks: list[dict]) -> str:
+    lines = [f"Scouting for {farm}: {len(tasks)} place{'s' if len(tasks) != 1 else ''} to check. Open each link on your phone, "
+             "go to the marked place and record what you find."]
+    lines += [f"{t['rank']}. {t['ref']}: {t['link']}" for t in tasks]
+    return "\n".join(lines)
+
+
+@app.get("/api/scouting/tasks", summary="A farm's scouting tasks and what the scouts found")
+def scouting_tasks(boundary_id: str, include_closed: bool = True, user=Depends(reader)):
+    farm = _farm(user, boundary_id)
+    with db.tx() as conn:
+        rows = conn.execute(TASK_SQL + "WHERE boundary_id = %s AND status <> 'cancelled'" + ("" if include_closed else " AND status = 'open'")
+                            + " ORDER BY status = 'open' DESC, rank", (farm["id"],)).fetchall()
+    open_ = [r for r in rows if r["status"] == "open"]
+    return {"farm": farm["name"], "tasks": rows, "open": len(open_), "message": _whatsapp_text(farm["name"], open_) if open_ else None}
+
+
+@app.post("/api/scouting/refresh", summary="Read the scouts' answers back from Geohub")
+def scouting_refresh(request: Request, user=Depends(need(feature="monitoring"))):
+    """Matches the records in the organization's Geohub scouting form to the tasks by their task reference. A record
+    a reviewer sent back, or a draft, is not taken."""
+    with db.tx() as conn:
+        st = conn.execute("SELECT scouting_form::text AS f FROM org_settings WHERE org_id = %s", (user["org_id"],)).fetchone()
+    if not st or not st["f"]:
+        raise Problem(409, "No Geohub scouting form is chosen yet.", code="no_scouting_form")
+    feats = [f for f in _all_features(request, st["f"]) if f.get("status") in ("submitted", "approved")]
+    by_ref = {}
+    for f in feats:
+        ref = (f.get("properties") or {}).get("task_ref")
+        if ref:
+            by_ref[str(ref).strip()] = f                       # the latest record for a task wins (oldest first)
+    updated = 0
+    with db.tx() as conn:
+        tasks = conn.execute("SELECT t.id::text AS id, t.ref, t.findings FROM scouting_tasks t JOIN boundaries b ON b.id = t.boundary_id "
+                             "WHERE b.org_id = %s AND t.status <> 'cancelled' AND t.ref = ANY(%s)",
+                             (user["org_id"], list(by_ref))).fetchall()
+        for t in tasks:
+            f = by_ref[t["ref"]]
+            p = f.get("properties") or {}
+            photos = p.get("photos") or []
+            findings = {"visited": p.get("visited"), "causes": p.get("causes") or [], "severity": p.get("severity"),
+                        "affected_pct": p.get("affected_pct"), "notes": p.get("notes"), "photos": len(photos) if isinstance(photos, list) else 0,
+                        "scout": f.get("created_by_name"), "recorded_at": f.get("updated_at") or f.get("created_at"),
+                        "reviewed": f.get("status") == "approved",
+                        "at": (f.get("geometry") or {}).get("coordinates")}
+            status = "unreachable" if p.get("visited") == "Could not reach it" else "found"
+            if findings != t["findings"]:
+                conn.execute("UPDATE scouting_tasks SET findings = %s, status = %s, geohub_feature = %s, found_at = now() WHERE id = %s",
+                             (Jsonb(findings), status, str(f["id"]), t["id"]))
+                updated += 1
+    return {"records_read": len(feats), "tasks_updated": updated}
+
+
+# ---------------------------------------------------------------------------
+# The season: NDVI from every usable Sentinel-2 image, radar from Sentinel-1, and green-up / peak / harvest
+# ---------------------------------------------------------------------------
+
+_JOBS = ThreadPoolExecutor(max_workers=2, thread_name_prefix="season")
+
+
+def _submit(fn, *args):
+    """Run a long job off the request (tests run it in place)."""
+    _JOBS.submit(fn, *args)
+
+
+def _job_update(job_id: str, **kw) -> None:
+    sets = ", ".join(f"{k} = %s" for k in kw)
+    vals = [Jsonb(v) if k == "result" else v for k, v in kw.items()]
+    with db.tx() as conn:
+        conn.execute(f"UPDATE season_jobs SET {sets}" + (", finished_at = now()" if kw.get("status") in ("done", "failed") else "")
+                     + " WHERE id = %s", (*vals, job_id))
+
+
+def _run_season_job(job_id: str) -> None:
+    try:
+        with db.tx() as conn:
+            job = conn.execute("SELECT j.*, b.geojson FROM season_jobs j JOIN boundaries b ON b.id = j.boundary_id WHERE j.id = %s",
+                               (job_id,)).fetchone()
+        if not job:
+            return
+        bid, geometry = str(job["boundary_id"]), job["geojson"]
+        start, end = job["start_date"].isoformat(), job["end_date"].isoformat()
+        _job_update(job_id, status="running", progress=2, message="Looking for images…")
+        import stac_client
+        result = {"optical": {"images": 0, "usable": 0, "failed": 0}, "radar": {"images": 0, "failed": 0}}
+        optical = stac_client.covering_scenes(geometry, start, end) if job["optical"] else []
+        radar = season_mod.radar_scenes(geometry, start, end) if job["radar"] else []
+        total = max(1, len(optical) + len(radar))
+        done = 0
+        for sc in optical:
+            try:
+                bands, meta = stac_client.fetch_and_clip_bands(sc["hrefs"], geometry, ["red", "nir"], reflectance_offset=sc["offset"])
+                arr = compute_index("ndvi", bands)
+                vf = meta.get("valid_fraction")
+                if np.isfinite(arr).any():
+                    monitoring_mod.save_observation(bid, "ndvi", sc["date"], "live", arr, scene_id=sc["scene_id"],
+                                                    cloud_cover=sc.get("cloud_cover"), valid_fraction=vf)
+                    result["optical"]["images"] += 1
+                    result["optical"]["usable"] += int((vf or 0) >= monitoring_mod.MIN_VALID_FRACTION)
+            except Exception as e:                      # one bad scene does not stop the season
+                log.warning("season job %s: optical %s failed: %s", job_id, sc.get("scene_id"), e)
+                result["optical"]["failed"] += 1
+            done += 1
+            _job_update(job_id, progress=int(5 + 90 * done / total), message=f"Optical images: {done} of {len(optical)}")
+        for sc in radar:
+            try:
+                vv, vh = season_mod.radar_arrays(sc, geometry)
+                if np.isfinite(vv).any() and np.isfinite(vh).any():
+                    field = np.isfinite(vv) | np.isfinite(vh)
+                    ok = np.isfinite(vv) & np.isfinite(vh)
+                    vf = float(ok.sum() / max(1, field.sum()))
+                    monitoring_mod.save_observation(bid, "rvi", sc["date"], "sentinel-1", season_mod.rvi(vv, vh),
+                                                    scene_id=sc["scene_id"], valid_fraction=vf)
+                    monitoring_mod.save_observation(bid, "vh_db", sc["date"], "sentinel-1", season_mod.to_db(vh),
+                                                    scene_id=sc["scene_id"], valid_fraction=vf)
+                    result["radar"]["images"] += 1
+            except Exception as e:
+                log.warning("season job %s: radar %s failed: %s", job_id, sc.get("scene_id"), e)
+                result["radar"]["failed"] += 1
+            done += 1
+            _job_update(job_id, progress=int(5 + 90 * done / total), message=f"Radar images: {done - len(optical)} of {len(radar)}")
+        _job_update(job_id, status="done", progress=100, result=result,
+                    message=f"{result['optical']['images']} optical ({result['optical']['usable']} clear enough) and "
+                            f"{result['radar']['images']} radar images added.")
+    except Exception as e:
+        log.exception("season job %s failed", job_id)
+        _job_update(job_id, status="failed", message=f"Could not build the season: {e}")
+
+
+JOB_SQL = ("SELECT id::text AS id, boundary_id::text AS boundary_id, start_date::text AS start_date, end_date::text AS end_date, "
+           "optical, radar, status, progress, message, result, created_by, created_at::text AS created_at, "
+           "finished_at::text AS finished_at FROM season_jobs ")
+
+
+@app.post("/api/season/build", summary="Fetch every usable satellite image of a farm over a date range (runs as a job)")
+def build_season(boundary_id: str = Form(...), start_date: str = Form(None), end_date: str = Form(None),
+                 optical: bool = Form(True), radar: bool = Form(True),
+                 user=Depends(need("agronomist", write=True, feature="monitoring"))):
+    """Sentinel-2 NDVI for every image that covers the farm (each pixel cloud-masked; images under 60% clear are kept
+    but not used for the reading) and Sentinel-1 radar (RVI and VH) for every pass, into the farm's timeline. Up to
+    400 days; default the last 9 months. Poll GET /api/season/jobs/{id}."""
+    farm = _farm(user, boundary_id)
+    try:
+        end = date_cls.fromisoformat(end_date) if end_date else date_cls.today()
+        start = date_cls.fromisoformat(start_date) if start_date else end - timedelta(days=270)
+    except ValueError:
+        raise HTTPException(400, "Dates are YYYY-MM-DD")
+    if not (0 < (end - start).days <= 400):
+        raise HTTPException(400, "The dates must run forwards, over at most 400 days")
+    if not (optical or radar):
+        raise HTTPException(400, "Choose optical, radar or both")
+    job_id = str(uuid.uuid4())
+    with db.tx() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (farm["id"],))
+        busy = conn.execute("SELECT 1 FROM season_jobs WHERE boundary_id = %s AND status IN ('queued', 'running')",
+                            (farm["id"],)).fetchone()
+        if busy:
+            raise Problem(409, "This farm's season is already being built. Wait for it to finish.", code="busy")
+        conn.execute("INSERT INTO season_jobs (id, org_id, boundary_id, start_date, end_date, optical, radar, created_by) "
+                     "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                     (job_id, user["org_id"], farm["id"], start, end, optical, radar, user["name"]))
+    _submit(_run_season_job, job_id)
+    return season_job(job_id, user)
+
+
+@app.get("/api/season/jobs/{job_id}")
+def season_job(job_id: str, user=Depends(reader)):
+    with db.tx() as conn:
+        row = conn.execute(JOB_SQL + "WHERE id = %s AND org_id = %s", (_uuid(job_id, "Job"), user["org_id"])).fetchone()
+    if not row:
+        raise Problem(404, "Job not found", code="not_found")
+    return row
+
+
+@app.get("/api/season", summary="The farm's season: NDVI and radar timelines, and green-up, peak and harvest")
+def season(boundary_id: str, start_date: str = None, end_date: str = None, user=Depends(need(feature="monitoring"))):
+    """Read from the images in the farm's timeline (build it first). NDVI images under 60% cloud-free are left out;
+    radar uses the farm's median RVI per pass. Sample data counts only where DEMO_TOOLS is on."""
+    farm = _farm(user, boundary_id)
+    lo, hi = (start_date or "0000-01-01")[:10], (end_date or "9999-12-31")[:10]
+
+    def series(index: str, sources: tuple[str, ...]):
+        rows = [o for o in monitoring_mod.list_observations(farm["id"], index) if o["source"] in sources and lo <= o["obs_date"] <= hi]
+        return rows
+
+    optical_sources = ("live", "demo") if settings.demo_tools else ("live",)
+    nd = series("ndvi", optical_sources)
+    rv = series("rvi", ("sentinel-1", "demo"))
+    vh = series("vh_db", ("sentinel-1", "demo"))
+    usable = [o for o in nd if (o["valid_fraction"] or 0) >= monitoring_mod.MIN_VALID_FRACTION and o["mean"] is not None]
+    reading = season_mod.season_reading([(o["obs_date"], o["mean"]) for o in usable],
+                                        [(o["obs_date"], o["median"]) for o in rv if o["median"] is not None],
+                                        (farm.get("details") or {}).get("planting_date"))
+    return {
+        "farm": farm["name"], **reading,
+        "series": {
+            "ndvi": [{"date": o["obs_date"], "value": None if o["mean"] is None else round(o["mean"], 3),
+                      "clear": round(o["valid_fraction"] or 0, 2), "used": o in usable} for o in nd],
+            "rvi": [{"date": o["obs_date"], "value": None if o["median"] is None else round(o["median"], 3)} for o in rv],
+            "vh_db": [{"date": o["obs_date"], "value": None if o["median"] is None else round(o["median"], 2)} for o in vh],
+        },
+        "cloudy_images": len(nd) - len(usable),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Weekly farm alerts
+# ---------------------------------------------------------------------------
+
+def _remember_licence(user: dict) -> None:
+    """Keep what the organization's licence allows, for the alerts sent with nobody signed in."""
+    with db.tx() as conn:
+        conn.execute("INSERT INTO org_settings (org_id, org_name, features, licence, seen_at) VALUES (%s, %s, %s, %s, now()) "
+                     "ON CONFLICT (org_id) DO UPDATE SET org_name = EXCLUDED.org_name, features = EXCLUDED.features, "
+                     "licence = EXCLUDED.licence, seen_at = now()",
+                     (user["org_id"], user["org_name"], Jsonb(user["features"]), user["licence"]))
+
+
+def org_alerts(org_id: str, today: date_cls | None = None) -> dict:
+    """This week's alerts for each of the organization's farms. Each source that cannot be reached is reported, and
+    the others still run."""
+    today = today or date_cls.today()
+    with db.tx() as conn:
+        farms = conn.execute("SELECT id::text AS id, name, geojson, ST_Y(ST_Centroid(geom)) AS lat, ST_X(ST_Centroid(geom)) AS lng "
+                             "FROM boundaries WHERE org_id = %s ORDER BY name", (org_id,)).fetchall()
+    unavailable: set[str] = set()
+    wx_cache: dict = {}
+    out = []
+    for f in farms:
+        found = []
+        cell = (round(f["lat"], 1), round(f["lng"], 1))                 # one weather call per ~10 km cell
+        if cell not in wx_cache:
+            try:
+                wx = weather_mod.get_recent_and_ahead(f["lat"], f["lng"])
+                try:
+                    climate = weather_mod.climate_summary(weather_mod.get_daily_history(f["lat"], f["lng"], 10))
+                except weather_mod.WeatherUnavailable:
+                    climate = None
+                wx_cache[cell] = (wx, climate)
+            except weather_mod.WeatherUnavailable:
+                wx_cache[cell] = None
+        if wx_cache[cell]:
+            wx, climate = wx_cache[cell]
+            found += alerts_mod.weather_alerts(wx, alerts_mod.wet_months_of(climate), today)
+        else:
+            unavailable.add("weather")
+        try:
+            fires = alerts_mod.fetch_fires(f["geojson"])
+            if fires is None:
+                unavailable.add("fire (FIRMS_MAP_KEY not set)")
+            else:
+                found += alerts_mod.fire_alerts(fires, f["geojson"])
+        except Exception:
+            unavailable.add("fire")
+        for index, sources in (("ndvi", ("live",)), ("rvi", ("sentinel-1",))):
+            obs = [o for o in monitoring_mod.list_observations(f["id"], index) if o["source"] in sources]
+            if obs:
+                found += alerts_mod.crop_alerts(monitoring_mod.analyze_trend(obs), index, today)
+        if found:
+            out.append({"boundary_id": f["id"], "name": f["name"], "alerts": found})
+    return {"farms_checked": len(farms), "farms": out, "alert_count": sum(len(x["alerts"]) for x in out),
+            "unavailable": sorted(unavailable), "checked_on": today.isoformat()}
+
+
+@app.get("/api/alerts", summary="This week's alerts on the organization's farms (as the weekly email would send them)")
+def get_alerts(user=Depends(need(feature="alerts"))):
+    _remember_licence(user)
+    with db.tx() as conn:
+        sub = conn.execute("SELECT 1 FROM alert_subscribers WHERE org_id = %s AND user_id = %s", (user["org_id"], user["id"])).fetchone()
+        last = conn.execute("SELECT sent_at::text AS sent_at, recipients FROM alert_runs WHERE org_id = %s ORDER BY sent_at DESC LIMIT 1",
+                            (user["org_id"],)).fetchone()
+    return org_alerts(user["org_id"]) | {"subscribed": bool(sub), "last_email": last, "email_set_up": mailer.configured()}
+
+
+@app.post("/api/alerts/subscribe", summary="Email me the weekly alerts")
+def alerts_subscribe(user=Depends(need(feature="alerts"))):
+    _remember_licence(user)
+    with db.tx() as conn:
+        conn.execute("INSERT INTO alert_subscribers (org_id, user_id, email, name) VALUES (%s, %s, %s, %s) ON CONFLICT (org_id, user_id) "
+                     "DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name", (user["org_id"], user["id"], user["email"], user["name"]))
+    return {"subscribed": True, "email": user["email"]}
+
+
+@app.delete("/api/alerts/subscribe", summary="Stop emailing me the weekly alerts")
+def alerts_unsubscribe(user=Depends(reader)):
+    with db.tx() as conn:
+        conn.execute("DELETE FROM alert_subscribers WHERE org_id = %s AND user_id = %s", (user["org_id"], user["id"]))
+    return {"subscribed": False}
+
+
+ALERT_EVERY = timedelta(days=7)
+
+
+def send_due_alerts(now: datetime | None = None) -> list[str]:
+    """Send the weekly email to each organization that is due: it has subscribers, its licence (as last seen, within 60
+    days) includes alerts and is not expired or suspended, and its last email was a week ago or more. Returns the
+    organizations sent to. Safe to run from several processes (an advisory lock per organization)."""
+    now = now or datetime.now(timezone.utc)
+    sent = []
+    with db.tx() as conn:
+        orgs = conn.execute(
+            "SELECT s.org_id::text AS org_id, s.org_name FROM org_settings s WHERE s.features ? 'alerts' "
+            "AND s.licence IN ('demo', 'active', 'grace') AND s.seen_at > %s "
+            "AND EXISTS (SELECT 1 FROM alert_subscribers a WHERE a.org_id = s.org_id) "
+            "AND NOT EXISTS (SELECT 1 FROM alert_runs r WHERE r.org_id = s.org_id AND r.sent_at > %s)",
+            (now - timedelta(days=60), now - ALERT_EVERY + timedelta(hours=1))).fetchall()
+    for o in orgs:
+        with db.tx() as conn:
+            if not conn.execute("SELECT pg_try_advisory_xact_lock(hashtext('alerts:' || %s))", (o["org_id"],)).fetchone()["pg_try_advisory_xact_lock"]:
+                continue
+            if conn.execute("SELECT 1 FROM alert_runs WHERE org_id = %s AND sent_at > %s",
+                            (o["org_id"], now - ALERT_EVERY + timedelta(hours=1))).fetchone():
+                continue
+            subs = conn.execute("SELECT email FROM alert_subscribers WHERE org_id = %s", (o["org_id"],)).fetchall()
+            result = org_alerts(o["org_id"], now.date())
+            if result["farms"]:
+                subject, body = alerts_mod.email_text(o["org_name"] or "your organization", result["farms"], settings.app_url)
+                for s_ in subs:
+                    try:
+                        mailer.send(s_["email"], subject, body)
+                    except Exception as e:
+                        log.warning("alerts: could not email %s: %s", s_["email"], e)
+            conn.execute("INSERT INTO alert_runs (org_id, farms, alerts, recipients) VALUES (%s, %s, %s, %s)",
+                         (o["org_id"], len(result["farms"]), Jsonb(result), len(subs) if result["farms"] else 0))
+            sent.append(o["org_id"])
+    return sent
+
+
+def _alerts_loop(stop: threading.Event) -> None:
+    while not stop.wait(3600):
+        try:
+            if mailer.configured():
+                send_due_alerts()
+        except Exception:
+            log.exception("weekly alerts run failed")
+
+
+# ---------------------------------------------------------------------------
+# Farm verification reports
+# ---------------------------------------------------------------------------
+
+@app.post("/api/reports/verification", summary="Issue a numbered farm verification report (PDF), kept as issued")
+def issue_verification(boundary_id: str = Form(...), user=Depends(need("agronomist", write=True, feature="verification"))):
+    farm = _farm(user, boundary_id)
+    geom = shape(farm["geojson"])
+    c = geom.centroid
+    d = farm.get("details") or {}
+    declared = d.get("declared_ha")
+    seasons, n_opt, n_rad = [], 0, 0
+    nd = [o for o in monitoring_mod.list_observations(farm["id"], "ndvi") if o["source"] == "live"
+          and (o["valid_fraction"] or 0) >= monitoring_mod.MIN_VALID_FRACTION and o["mean"] is not None]
+    rv = [o for o in monitoring_mod.list_observations(farm["id"], "rvi") if o["source"] == "sentinel-1" and o["median"] is not None]
+    years = sorted({o["obs_date"][:4] for o in nd + rv})[-3:]
+    for y in years:
+        ny = [(o["obs_date"], o["mean"]) for o in nd if o["obs_date"].startswith(y)]
+        ry = [(o["obs_date"], o["median"]) for o in rv if o["obs_date"].startswith(y)]
+        n_opt, n_rad = n_opt + len(ny), n_rad + len(ry)
+        r = season_mod.season_reading(ny, ry)
+        why = None if r["based_on"] else " ".join(x for x in (r["optical"].get("reason"), r["radar"].get("reason")) if x)
+        seasons.append({"year": int(y), "based_on": r["based_on"], "why": why,
+                        **{k: r.get(k) for k in ("planting", "greenup", "peak", "end")}})
+    try:
+        hist = weather_mod.get_daily_history(c.y, c.x, 10)
+        rain = reports_mod.rainfall(hist, weather_mod.climate_summary(hist))
+    except weather_mod.WeatherUnavailable:
+        rain = None
+    issued_at, issued_on = reports_mod.issued_now()
+    code = reports_mod.new_code()
+    content = {
+        "code": code, "issued_at": issued_at, "issued_on": issued_on, "org_name": user["org_name"], "issued_by": user["name"],
+        "verify_url": f"{settings.app_url}/verify.html?code={code}",
+        "farm": {"name": farm["name"], "area_ha": farm["area_ha"], "lat": c.y, "lng": c.x,
+                 "declared_ha": declared, "declared_vs_measured_pct": round(100 * (float(declared) - farm["area_ha"]) / farm["area_ha"])
+                 if declared else None, "community": d.get("community"), "lga": d.get("lga"), "state": d.get("state"),
+                 "farmer": d.get("farmer_name"), "crops": d.get("crops"), "mapped_by": d.get("collected_by") if farm.get("source") == "geohub" else None},
+        "geometry": farm["geojson"], "seasons": seasons, "images": {"optical": n_opt, "radar": n_rad},
+        "rainfall": rain, "title": reports_mod.title_status(c.y, c.x),
+    }
+    rid = str(uuid.uuid4())
+    with db.tx() as conn:
+        conn.execute("INSERT INTO farm_reports (id, code, org_id, org_name, boundary_id, content, created_by) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                     (rid, code, user["org_id"], user["org_name"], farm["id"], Jsonb(content), user["name"]))
+    return {"id": rid, "code": code, "pdf": f"/api/reports/{rid}/pdf", "seasons": len(seasons),
+            "warnings": [w for w, bad in (("The farm's satellite timeline is empty: build the season first.", not seasons),
+                                          ("Rainfall could not be fetched.", rain is None)) if bad]}
+
+
+@app.get("/api/reports", summary="The organization's verification reports (optionally for one farm)")
+def list_reports(boundary_id: str | None = None, user=Depends(reader)):
+    q = ("SELECT id::text AS id, code, boundary_id::text AS boundary_id, content->'farm'->>'name' AS farm, created_by, "
+         "created_at::text AS created_at FROM farm_reports WHERE org_id = %s")
+    args = [user["org_id"]]
+    if boundary_id:
+        q += " AND boundary_id = %s"
+        args.append(_farm(user, boundary_id)["id"])
+    with db.tx() as conn:
+        return conn.execute(q + " ORDER BY created_at DESC LIMIT 200", args).fetchall()
+
+
+@app.get("/api/reports/{report_id}/pdf")
+def report_pdf(report_id: str, user=Depends(reader)):
+    with db.tx() as conn:
+        row = conn.execute("SELECT code, content FROM farm_reports WHERE id = %s AND org_id = %s",
+                           (_uuid(report_id, "Report"), user["org_id"])).fetchone()
+    if not row:
+        raise Problem(404, "Report not found", code="not_found")
+    return StreamingResponse(io.BytesIO(reports_mod.build_pdf(row["content"])), media_type="application/pdf",
+                             headers={"Content-Disposition": f'attachment; filename="{row["code"]}.pdf"'})
+
+
+@app.get("/api/verify/{code}", summary="Anyone holding a report checks it is genuine (no sign-in)")
+def verify_report(code: str):
+    with db.tx() as conn:
+        row = conn.execute("SELECT code, org_name, created_at::text AS created_at, content FROM farm_reports WHERE code = %s",
+                           (code.strip().upper()[:20],)).fetchone()
+    if not row:
+        return {"valid": False, "code": code}
+    f = row["content"]["farm"]
+    return {"valid": True, "code": row["code"], "issued_to": row["org_name"], "issued_at": row["created_at"],
+            "farm": f["name"], "area_ha": f["area_ha"], "where": ", ".join(x for x in (f.get("community"), f.get("lga"), f.get("state")) if x),
+            "seasons": [s["year"] for s in row["content"]["seasons"] if s.get("based_on")]}
 
 
 app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")

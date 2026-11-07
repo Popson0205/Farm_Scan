@@ -5,9 +5,9 @@ out, the next request refreshes both, which also checks with Geohub that the org
 
 Roles come from the person's role in their Geohub organization:
   manager    = owner or admin: everything, including deleting farms
-  agronomist = member: adds farms, runs imagery, plots, zones, notes
+  agronomist = member: adds farms, runs imagery, zones, notes
   viewer     = collector or viewer, and GeoEstate staff: reads only
-The plan's features (monitoring, zones, suitability, drone, plant_count, prescriptions) and its hectare limit come
+The plan's features (monitoring, zones, suitability, prescriptions, alerts, verification) and its hectare limit come
 from the licence. An expired licence is read-only and a suspended one closed, as in Geohub."""
 import secrets
 
@@ -20,7 +20,8 @@ AT, RT = "farm_at", "farm_rt"
 ROLE_OF = {"owner": "manager", "admin": "manager", "member": "agronomist", "collector": "viewer", "viewer": "viewer"}
 RANK = {"viewer": 0, "agronomist": 1, "manager": 2}
 FEATURE_WORDS = {"monitoring": "Satellite monitoring", "zones": "Management zones", "suitability": "Crop suitability",
-                 "drone": "Drone imagery", "plant_count": "Plant counts", "prescriptions": "Variable-rate prescriptions"}
+                 "prescriptions": "Variable-rate prescriptions",
+                 "alerts": "Weekly farm alerts", "verification": "Farm verification reports"}
 gid: GeoEstateID | None = None       # tests swap this for one that talks to a stand-in Geohub
 
 

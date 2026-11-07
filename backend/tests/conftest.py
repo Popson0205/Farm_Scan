@@ -20,7 +20,7 @@ import db  # noqa: E402
 import identity  # noqa: E402
 
 ORG = "11111111-1111-4111-8111-111111111111"
-ALL = ["monitoring", "zones", "suitability", "drone", "plant_count", "prescriptions"]
+ALL = ["monitoring", "zones", "suitability", "alerts", "prescriptions", "verification"]
 
 
 def make_user(**kw) -> dict:
@@ -43,7 +43,7 @@ def _current():
 def database():
     db.start()
     with db.tx() as conn:
-        conn.execute("TRUNCATE boundaries, drone_files, api_cache CASCADE")
+        conn.execute("TRUNCATE boundaries, api_cache CASCADE")
     import main
     main.app.dependency_overrides[identity.current_user] = _current
     yield

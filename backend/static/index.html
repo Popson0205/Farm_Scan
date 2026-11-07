@@ -64,11 +64,20 @@
   #signin .err { color: var(--danger); font-size: 13px; }
   .section.locked > *:not(h2):not(.plan-note) { opacity: .45; pointer-events: none; }
   .plan-note { font-size: 12px; color: #6b4e00; background: #fff4d6; border-radius: 7px; padding: 7px 10px; margin: 0 0 10px; }
+  .health-dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+  .pf-row { display:grid; grid-template-columns: 28px 1fr auto; gap:6px; align-items:center; padding:8px 10px; border:1px solid var(--border);
+    border-radius:8px; margin-bottom:6px; cursor:pointer; font-size:12.5px; background:#fff; }
+  .pf-row:hover { border-color: var(--green-400); }
+  .pf-row .meta { color: var(--muted); font-size: 11.5px; }
+  .pf-row .alert { color: var(--danger); font-weight: 600; }
+  .task-row { border:1px solid var(--border); border-radius:8px; padding:8px 10px; margin-bottom:6px; font-size:12.5px; }
+  .task-row .ref { font-weight:700; }
+  .task-row.found { border-color:#9fd3b0; background:#f1faf4; } .task-row.unreachable { border-color:#f0dca0; background:#fffaf0; }
   .sample-note { font-size: 12px; color: #8a2b16; background: #fde7e2; border-radius: 7px; padding: 7px 10px; margin: 8px 0 0; }
 
   #body { flex: 1; display: flex; min-height: 0; }
 
-  /* ---- Sidebars (left: vegetation health, right: plots &amp; field data) ---- */
+  /* ---- Sidebar ---- */
   .sidebar {
     width: 360px; min-width: 360px;
     background: var(--card-bg);
@@ -76,7 +85,6 @@
     overflow-y: auto;
   }
   #sidebar-left { border-right: 1px solid var(--border); }
-  #sidebar-right { border-left: 1px solid var(--border); }
   .sidebar-title {
     padding: 14px 22px 10px;
     border-bottom: 1px solid var(--border);
@@ -151,7 +159,7 @@
 
   .hint { font-size: 11.5px; color: var(--muted); line-height: 1.5; margin-top: 6px; }
 
-  /* ---- Result tables (per-plot stats, plant counts, etc.) ---- */
+  /* ---- Result tables ---- */
   .table-wrap { max-height: 260px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; margin-top: 8px; }
   table.data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   table.data-table thead th {
@@ -179,14 +187,14 @@
 <div id="app">
   <div id="topbar">
     <h1>🌾 FarmScan</h1>
-    <p>Vegetation health (left) · Plots, plant counts &amp; statistics (right)</p>
+    <p>Satellite crop monitoring</p>
     <div id="account"></div>
   </div>
   <div id="licence-banner" role="status"></div>
   <div id="signin" role="dialog" aria-labelledby="signin-title">
     <div class="card">
       <h2 id="signin-title">FarmScan</h2>
-      <p>Satellite crop monitoring, management zones, drone plant counts and crop suitability for your farms. Sign in with your GeoEstate account (Geohub) to continue.</p>
+      <p>Satellite crop monitoring, planting and harvest dates, management zones, weekly alerts and crop suitability for your farms. Sign in with your GeoEstate account (Geohub) to continue.</p>
       <p class="err" id="signin-error"></p>
       <a class="btn btn-primary" id="signin-btn" href="/api/auth/sign-in?next=/" style="display:block; text-align:center; text-decoration:none;">Sign in with GeoEstate</a>
     </div>
@@ -194,7 +202,7 @@
 
   <div id="body">
   <div id="sidebar-left" class="sidebar">
-    <div class="sidebar-title">Vegetation Health<span class="sub">Satellite / drone index analysis</span></div>
+    <div class="sidebar-title">Vegetation Health<span class="sub">Sentinel-2 and Sentinel-1 satellite analysis</span></div>
 
     <div class="section">
       <h2>1 · Farm Boundary</h2>
@@ -203,6 +211,17 @@
         <button class="btn btn-secondary" id="btn-upload">📁 Upload GeoJSON</button>
       </div>
       <input type="file" id="file-input" accept=".json,.geojson" style="display:none;">
+      <div class="btn-row" style="margin-bottom:10px;">
+        <button class="btn btn-secondary" id="btn-portfolio">🗺 All farms</button>
+        <button class="btn btn-secondary" id="btn-import-geohub">⬇ From Geohub</button>
+      </div>
+      <div id="geohub-import" style="display:none; margin-bottom:10px;">
+        <label for="geohub-enum-form">Geohub "Farm enumeration" form</label>
+        <select id="geohub-enum-form"></select>
+        <button class="btn btn-primary" id="btn-run-import">Bring in its farms</button>
+        <div class="hint">Every submitted or approved record with a walked boundary becomes a farm with its farmer's details. Run it again as more come in: farms already here are skipped.</div>
+      </div>
+      <div id="farm-details" class="hint" style="display:none; margin:0 0 8px;"></div>
       <div id="farm-list"></div>
       <div class="status-msg" id="boundary-status"></div>
     </div>
@@ -267,6 +286,20 @@
       <button class="btn btn-secondary demo-only" id="btn-demo-season" style="margin-top:8px; display:none;">🧪 Practice: add a sample season (4 made-up dates)</button>
       <div id="timeline-box" style="display:none; margin-top:10px;"></div>
 
+      <div style="margin-top:16px; border-top:1px solid var(--border); padding-top:12px;">
+        <label>The season: planting and harvest</label>
+        <div class="hint" style="margin:0 0 8px;">Every usable Sentinel-2 image, plus Sentinel-1 radar that sees through rainy-season cloud, read for when the crop greened up, peaked and was harvested.</div>
+        <div style="display:flex; gap:8px;">
+          <input type="date" id="season-start" aria-label="Season from">
+          <input type="date" id="season-end" aria-label="Season to">
+        </div>
+        <label style="display:flex; gap:8px; align-items:center; font-size:12px; margin:2px 0 4px;"><input type="checkbox" id="season-optical" checked style="width:auto; margin:0;"> Optical (Sentinel-2)</label>
+        <label style="display:flex; gap:8px; align-items:center; font-size:12px; margin:0 0 8px;"><input type="checkbox" id="season-radar" checked style="width:auto; margin:0;"> Radar (Sentinel-1)</label>
+        <button class="btn btn-primary" id="btn-season-build">🛰 Build the season from satellite</button>
+        <button class="btn btn-secondary" id="btn-season-show" style="margin-top:8px;">📅 Show the season</button>
+        <div id="season-box" style="display:none; margin-top:10px;"></div>
+      </div>
+
       <div style="margin-top:16px;">
         <label>Problem-area sensitivity</label>
         <select id="scout-sensitivity">
@@ -279,8 +312,64 @@
         </label>
         <button class="btn btn-primary" id="btn-problem-areas">🔎 Find problem areas</button>
         <div id="problem-box" style="display:none; margin-top:10px;"></div>
+        <div style="margin-top:12px;">
+          <button class="btn btn-secondary" id="btn-send-scouts">📲 Send problem areas to scouts (Geohub)</button>
+          <button class="btn btn-secondary" id="btn-scout-answers" style="margin-top:8px;">✅ Check scouts' answers</button>
+          <div id="scouting-setup" class="hint" style="display:none;"></div>
+          <div id="scout-box" style="display:none; margin-top:10px;"></div>
+        </div>
       </div>
       <div class="status-msg" id="monitor-status"></div>
+    </div>
+
+    <div class="section" data-feature="zones">
+      <h2>Management Zones</h2>
+      <div style="display:flex; gap:8px;">
+        <select id="n-zones" style="margin-bottom:8px;">
+          <option value="3">3 zones</option>
+          <option value="5">5 zones</option>
+        </select>
+        <button class="btn btn-secondary" id="btn-classify-zones" style="margin-bottom:8px;">Classify</button>
+      </div>
+      <div class="hint">Clusters the current index into low/medium/high zones — the basis for a variable-rate prescription file.</div>
+      <div data-feature="prescriptions" class="section-part">
+      <div class="hint" style="margin-bottom:8px;">Optional — add your flat-rate recommendation to get a rate plan per zone:</div>
+      <div style="display:flex; gap:8px;">
+        <input type="number" id="zone-base-rate" placeholder="Base rate (e.g. 90)" min="0" step="any" style="margin-bottom:8px;">
+        <input type="text" id="zone-unit" value="kg/ha" style="margin-bottom:8px;">
+      </div>
+      <select id="zone-strategy" style="margin-bottom:8px;">
+        <option value="compensate">More input on weak zones (nutrient-limited)</option>
+        <option value="capitalize">More input on strong zones (high-potential)</option>
+      </select>
+      <select id="zone-spread" style="margin-bottom:8px;">
+        <option value="0.1">Vary rate ±10%</option>
+        <option value="0.2" selected>Vary rate ±20%</option>
+        <option value="0.3">Vary rate ±30%</option>
+      </select>
+      </div>
+      <div id="zone-plan-box" style="display:none;"></div>
+      <div class="btn-row" style="margin-top:8px;">
+        <button class="btn btn-secondary" id="exp-shp-zones">⬇ SHP (zones / prescription)</button>
+      </div>
+      <div class="status-msg" id="zones-status"></div>
+    </div>
+
+    <div class="section" data-feature="alerts">
+      <h2>Weekly Alerts</h2>
+      <div class="hint" style="margin:0 0 10px;">Dry spells, heavy rain, heat, fires near the farms and crop drops, across all your farms: here, and by email every week if you ask.</div>
+      <button class="btn btn-secondary" id="btn-alerts">🔔 This week's alerts</button>
+      <button class="btn btn-secondary" id="btn-alerts-sub" style="margin-top:8px;">✉ Email me these every week</button>
+      <div id="alerts-box" style="display:none; margin-top:10px;"></div>
+      <div class="status-msg" id="alerts-status"></div>
+    </div>
+
+    <div class="section" data-feature="verification">
+      <h2>Verification Report</h2>
+      <div class="hint" style="margin:0 0 10px;">A numbered PDF for a lender, insurer or buyer: the farm's measured area, its crop seasons from the satellites, rainfall against normal and, where the land is on GeoEstate Land Registry, its title status. Anyone holding it can check it is genuine.</div>
+      <button class="btn btn-primary" id="btn-verify-report">📄 Issue a report for this farm</button>
+      <div id="reports-box" style="margin-top:10px;"></div>
+      <div class="status-msg" id="report-status"></div>
     </div>
 
     <div class="section" data-feature="suitability">
@@ -300,6 +389,7 @@
         <button class="btn btn-secondary" id="exp-geotiff">GeoTIFF</button>
         <button class="btn btn-secondary" id="exp-pdf">PDF report</button>
       </div>
+      <button class="btn btn-secondary" id="btn-share" style="margin-top:8px;">🔗 Get share link</button>
       <div class="status-msg" id="export-status"></div>
     </div>
 
@@ -313,131 +403,6 @@
 
   <div id="map"></div>
 
-  <div id="sidebar-right" class="sidebar">
-    <div class="sidebar-title">Plots &amp; Field Data<span class="sub">Drone imagery, plant counts, plot editing &amp; per-plot data</span></div>
-
-    <div class="section" data-feature="drone">
-      <h2>Drone Orthomosaic</h2>
-      <div class="hint" style="margin-bottom:8px;">Needs a cm-resolution drone orthomosaic (Pix4D/Agisoft/ODM output) — satellite imagery is too coarse to resolve individual plants or plots.</div>
-      <input type="file" id="drone-file-input" accept=".tif,.tiff" style="margin-bottom:8px;">
-      <button class="btn btn-secondary" id="btn-drone-upload">⬆ Upload orthomosaic</button>
-      <div class="status-msg" id="drone-status"></div>
-      <div id="drone-result" class="hint" style="margin-top:8px;"></div>
-      <div class="btn-row" style="margin-top:10px;">
-        <button class="btn btn-secondary" id="btn-toggle-drone-overlay" style="display:none;">🖼 Hide image on map</button>
-      </div>
-    </div>
-
-    <div class="section" data-feature="plant_count">
-      <h2>Plant Counts</h2>
-      <button class="btn btn-secondary" id="btn-plant-count" disabled>🌱 Count plants (field-wide)</button>
-      <button class="btn btn-secondary" id="btn-plant-count-per-plot" style="margin-top:8px;" disabled>🌱 Count plants per plot</button>
-    </div>
-
-    <div class="section">
-      <h2>Image Acquisition Requirements</h2>
-      <div class="hint">For plant counts to work, upload a <b>nadir (straight-down) orthomosaic GeoTIFF</b> stitched from a drone flight — not a single oblique photo. Typical settings: fly at a height giving 2–5cm/pixel ground resolution, 75%+ front overlap and 65%+ side overlap between photos, then stitch with Pix4D, DroneDeploy, Agisoft Metashape, or the free OpenDroneMap. Export the result as a GeoTIFF (.tif). A single non-georeferenced photo (e.g. a phone or gimbal shot) will not produce accurate counts or areas.</div>
-    </div>
-
-    <div class="section">
-      <h2>Manual Plot Tools</h2>
-      <div style="display:flex; gap:8px;">
-        <input type="number" id="grid-rows" placeholder="Rows" value="4" style="margin-bottom:8px;">
-        <input type="number" id="grid-cols" placeholder="Cols" value="5" style="margin-bottom:8px;">
-      </div>
-      <button class="btn btn-secondary" id="btn-gen-plots">▦ Generate manual grid plots</button>
-      <div class="hint">Splits the boundary into a regular, evenly-sized grid — use this for planned layouts before any imagery exists.</div>
-      <div class="status-msg" id="plots-status"></div>
-
-      <div style="margin-top:14px;">
-        <label>Edit plots</label>
-        <div class="btn-row">
-          <button class="btn btn-secondary" id="btn-toggle-plot-edit">✎ Edit / add / delete plots</button>
-        </div>
-        <div class="hint">Turns on map editing for the current plots — drag a corner to reshape, draw a new polygon to add a plot, or use the trash tool to delete one. Changes save automatically.</div>
-      </div>
-
-      <div style="margin-top:14px;">
-        <label>Import plots</label>
-        <input type="file" id="plots-import-input" accept=".zip,.kml" style="margin-bottom:8px;">
-        <button class="btn btn-secondary" id="btn-import-plots">⬆ Import SHP (.zip) or KML</button>
-        <div class="hint">Already digitized plots elsewhere (QGIS, a trial-management tool)? Import them directly instead of generating a grid or drawing them.</div>
-      </div>
-
-      <div style="margin-top:14px;" data-feature="zones" class="section-part">
-        <label>Management zones</label>
-        <div style="display:flex; gap:8px;">
-          <select id="n-zones" style="margin-bottom:8px;">
-            <option value="3">3 zones</option>
-            <option value="5">5 zones</option>
-          </select>
-          <button class="btn btn-secondary" id="btn-classify-zones" style="margin-bottom:8px;">Classify</button>
-        </div>
-        <div class="hint">Clusters the current index into low/medium/high zones — the basis for a variable-rate prescription file.</div>
-        <div data-feature="prescriptions" class="section-part">
-        <div class="hint" style="margin-bottom:8px;">Optional — add your flat-rate recommendation to get a rate plan per zone:</div>
-        <div style="display:flex; gap:8px;">
-          <input type="number" id="zone-base-rate" placeholder="Base rate (e.g. 90)" min="0" step="any" style="margin-bottom:8px;">
-          <input type="text" id="zone-unit" value="kg/ha" style="margin-bottom:8px;">
-        </div>
-        <select id="zone-strategy" style="margin-bottom:8px;">
-          <option value="compensate">More input on weak zones (nutrient-limited)</option>
-          <option value="capitalize">More input on strong zones (high-potential)</option>
-        </select>
-        <select id="zone-spread" style="margin-bottom:8px;">
-          <option value="0.1">Vary rate ±10%</option>
-          <option value="0.2" selected>Vary rate ±20%</option>
-          <option value="0.3">Vary rate ±30%</option>
-        </select>
-        </div>
-        <div id="zone-plan-box" style="display:none;"></div>
-      </div>
-    </div>
-
-    <div class="section">
-      <h2>Per-Plot Statistics</h2>
-      <button class="btn btn-secondary" id="btn-plot-stats">Σ Compute per-plot stats (uses last-run index)</button>
-      <div class="hint">Requires a vegetation index to be run first in the left panel (1–3, then ▶ Run) for this same farm — per-plot stats are computed from that cached result, not recomputed from scratch.</div>
-      <div id="plot-stats-table-wrap" class="table-wrap" style="display:none;">
-        <table class="data-table" id="plot-stats-table">
-          <thead><tr><th>Plot</th><th>Row</th><th>Col</th><th>Area (m²)</th><th>Mean</th><th>Min</th><th>Max</th><th>Std</th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <div class="table-caption" id="plot-stats-caption"></div>
-      <button class="btn btn-secondary" id="btn-plot-rank" style="margin-top:8px;">🏁 Rank plots vs field baseline</button>
-      <div id="plot-rank-wrap" class="table-wrap" style="display:none;">
-        <table class="data-table" id="plot-rank-table">
-          <thead><tr><th>#</th><th>Plot</th><th>Mean</th><th>vs median</th><th>z</th><th>Flag</th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <div class="table-caption" id="plot-rank-caption"></div>
-
-      <div id="plant-count-table-wrap" class="table-wrap" style="display:none; margin-top:12px;">
-        <table class="data-table" id="plant-count-table">
-          <thead><tr><th>Plot</th><th>Row</th><th>Col</th><th>Plant count</th><th>Mean canopy (m²)</th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <div class="table-caption" id="plant-count-caption"></div>
-    </div>
-
-    <div class="section">
-      <h2>Plot &amp; Zone Exports</h2>
-      <div class="btn-row">
-        <button class="btn btn-secondary" id="exp-excel">Excel (plots)</button>
-        <button class="btn btn-secondary" id="exp-shp-plots">SHP (plots)</button>
-      </div>
-      <div class="btn-row" style="margin-top:8px;">
-        <button class="btn btn-secondary" id="exp-shp-zones">SHP (zones / prescription)</button>
-      </div>
-      <div class="btn-row" style="margin-top:8px;">
-        <button class="btn btn-secondary" id="btn-share">🔗 Get share link</button>
-      </div>
-      <div class="status-msg" id="export-status-plots"></div>
-    </div>
-  </div>
   </div>
 </div>
 
@@ -588,7 +553,7 @@ function renderFarmList() {
       x.style.cssText = 'margin-left:8px; border:0; background:none; color:#8a2b16; cursor:pointer; font-size:13px;';
       x.onclick = async (e) => {
         e.stopPropagation();
-        if (!confirm(`Remove "${f.name}" with its plots, timeline and notes? This cannot be undone.`)) return;
+        if (!confirm(`Remove "${f.name}" with its timeline, notes and scouting tasks? This cannot be undone.`)) return;
         const res = await fetch(`${API_BASE}/boundary/${f.id}`, { method: 'DELETE' });
         if (!res.ok) { showStatus('boundary-status', (await res.json()).detail || 'Could not remove it.', 'error'); return; }
         currentBoundaries = currentBoundaries.filter(b => b.id !== f.id);
@@ -602,7 +567,7 @@ function renderFarmList() {
   });
 }
 
-// Open one of the organization's farms: its boundary, plots and notes.
+// Open one of the organization's farms: its boundary and notes.
 async function openFarm(id) {
   try {
     const res = await fetch(`${API_BASE}/boundary/${id}`);
@@ -615,8 +580,6 @@ async function openFarm(id) {
     map.fitBounds(L.geoJSON(f.geojson).getBounds());
     renderFarmList();
     if (overlayLayer) { map.removeLayer(overlayLayer); overlayLayer = null; }
-    const pr = await fetch(`${API_BASE}/plots/${id}`);
-    if (pr.ok) { const p = await pr.json(); if (typeof drawPlotsOnMap === 'function') drawPlotsOnMap(p.plots); }
     if (typeof loadAnnotations === 'function') loadAnnotations();
   } catch (err) {
     showStatus('boundary-status', `Error: ${err.message}`, 'error');
@@ -745,220 +708,16 @@ document.getElementById('date-end').value = today.toISOString().slice(0, 10);
 document.getElementById('date-start').value = monthAgo.toISOString().slice(0, 10);
 
 // =====================================================================
-// 4. Plots & Zones
+// 4. Management zones
 // =====================================================================
-let plotsLayer = null;
 let zonesLayer = null;
 const ZONE_COLORS_3 = ['#d73027', '#ffffbf', '#1a9850'];
 const ZONE_COLORS_5 = ['#d73027', '#fc8d59', '#ffffbf', '#91cf60', '#1a9850'];
 
-// Editable feature group for plots — lets the user drag/reshape, draw new
-// plots, or delete one, wired to /api/plots/{boundary_id}/edit|add|{plot_id}.
-const plotsEditGroup = new L.FeatureGroup();
-map.addLayer(plotsEditGroup);
-let plotEditControl = null;
-let plotEditModeOn = false;
-let nextManualPlotRow = 0;
-
-document.getElementById('btn-gen-plots').onclick = async () => {
-  if (!currentBoundaryId) { showStatus('plots-status', 'Import or draw a farm boundary first.', 'error'); return; }
-  const rows = document.getElementById('grid-rows').value;
-  const cols = document.getElementById('grid-cols').value;
-  showStatus('plots-status', 'Generating plot grid…', 'info');
-  const form = new FormData();
-  form.append('boundary_id', currentBoundaryId);
-  form.append('rows', rows);
-  form.append('cols', cols);
-  try {
-    const res = await fetch(`${API_BASE}/plots/generate-grid`, { method: 'POST', body: form });
-    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
-    const data = await res.json();
-    drawPlotsOnMap(data.plots);
-    showStatus('plots-status', `${data.plot_count} plots generated (${data.rows}×${data.cols}).`, 'success');
-  } catch (err) {
-    showStatus('plots-status', `Error: ${err.message}`, 'error');
-  }
-};
-
-function drawPlotsOnMap(plotList) {
-  if (plotsLayer) map.removeLayer(plotsLayer);
-  plotsEditGroup.clearLayers();
-  plotsLayer = L.geoJSON(plotList.map(p => ({ type: 'Feature', properties: p, geometry: p.geometry })), {
-    style: { color: '#1a1f1c', weight: 1, fillOpacity: 0, dashArray: '3,3' },
-    onEachFeature: (feature, layer) => plotsEditGroup.addLayer(layer)
-  });
-  // plotsLayer itself isn't added to the map — its rendered copies live in
-  // plotsEditGroup so leaflet.draw's edit toolbar can operate on them.
-}
-
-document.getElementById('btn-toggle-plot-edit').onclick = () => {
-  if (!currentBoundaryId) { showStatus('plots-status', 'Import or draw a farm boundary first.', 'error'); return; }
-  plotEditModeOn = !plotEditModeOn;
-  const btn = document.getElementById('btn-toggle-plot-edit');
-  if (plotEditModeOn) {
-    plotEditControl = new L.Control.Draw({
-      position: 'topright',
-      edit: { featureGroup: plotsEditGroup },
-      draw: {
-        polygon: { allowIntersection: false, showArea: true, shapeOptions: { color: '#b3462c' } },
-        rectangle: { shapeOptions: { color: '#b3462c' } },
-        polyline: false, circle: false, circlemarker: false, marker: false
-      }
-    });
-    map.addControl(plotEditControl);
-    btn.textContent = '✓ Done editing plots';
-    showStatus('plots-status', 'Edit mode on — drag corners to reshape, draw to add, trash tool to delete.', 'info');
-  } else {
-    if (plotEditControl) map.removeControl(plotEditControl);
-    btn.textContent = '✎ Edit / add / delete plots';
-    showStatus('plots-status', 'Edit mode off.', 'success');
-  }
-};
-
-map.on(L.Draw.Event.EDITED, async (e) => {
-  if (!currentBoundaryId) return;
-  const layers = e.layers;
-  let count = 0;
-  for (const layer of layers) {
-    const props = layer.feature && layer.feature.properties;
-    if (!props || props.plot_id === undefined) continue;
-    const form = new FormData();
-    form.append('plot_id', props.plot_id);
-    form.append('geojson', JSON.stringify(layer.toGeoJSON().geometry));
-    try {
-      await fetch(`${API_BASE}/plots/${currentBoundaryId}/edit`, { method: 'POST', body: form });
-      count++;
-    } catch (err) { /* keep going for other layers */ }
-  }
-  showStatus('plots-status', `Saved ${count} edited plot(s).`, 'success');
-});
-
-map.on(L.Draw.Event.DELETED, async (e) => {
-  if (!currentBoundaryId) return;
-  const layers = e.layers;
-  let count = 0;
-  for (const layer of layers) {
-    const props = layer.feature && layer.feature.properties;
-    if (!props || props.plot_id === undefined) continue;
-    try {
-      await fetch(`${API_BASE}/plots/${currentBoundaryId}/${props.plot_id}`, { method: 'DELETE' });
-      count++;
-    } catch (err) { /* keep going */ }
-  }
-  showStatus('plots-status', `Deleted ${count} plot(s).`, 'success');
-});
-
-// only fires for shapes drawn while the plot-edit toolbar is active, since the
-// boundary draw toolbar (L.Draw.Event.CREATED handler above) also listens on
-// the same map — distinguish by checking edit mode is on.
-map.on(L.Draw.Event.CREATED, async (e) => {
-  if (!plotEditModeOn || !currentBoundaryId) return;
-  const layer = e.layer;
-  const geometry = layer.toGeoJSON().geometry;
-  const form = new FormData();
-  form.append('geojson', JSON.stringify(geometry));
-  form.append('row', nextManualPlotRow++);
-  form.append('col', 0);
-  try {
-    const res = await fetch(`${API_BASE}/plots/${currentBoundaryId}/add`, { method: 'POST', body: form });
-    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
-    const data = await res.json();
-    layer.feature = { type: 'Feature', properties: data, geometry };
-    plotsEditGroup.addLayer(layer);
-    showStatus('plots-status', `Added plot ${data.plot_id}.`, 'success');
-  } catch (err) {
-    showStatus('plots-status', `Error: ${err.message}`, 'error');
-  }
-});
-
-document.getElementById('btn-import-plots').onclick = async () => {
-  if (!currentBoundaryId) { showStatus('plots-status', 'Import or draw a farm boundary first.', 'error'); return; }
-  const fileInput = document.getElementById('plots-import-input');
-  if (!fileInput.files[0]) { showStatus('plots-status', 'Choose a .zip (shapefile) or .kml file first.', 'error'); return; }
-  showStatus('plots-status', 'Importing plots…', 'info');
-  const form = new FormData();
-  form.append('boundary_id', currentBoundaryId);
-  form.append('file', fileInput.files[0]);
-  try {
-    const res = await fetch(`${API_BASE}/plots/import`, { method: 'POST', body: form });
-    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
-    const data = await res.json();
-    drawPlotsOnMap(data.plots);
-    showStatus('plots-status', `${data.plot_count} plots imported.`, 'success');
-  } catch (err) {
-    showStatus('plots-status', `Error: ${err.message}`, 'error');
-  }
-};
-
-document.getElementById('btn-plot-stats').onclick = async () => {
-  if (!currentBoundaryId) { showStatus('plots-status', 'Import or draw a farm boundary first.', 'error'); return; }
-  if (!lastProcessedIndex || lastProcessedBoundaryId !== currentBoundaryId) {
-    showStatus('plots-status',
-      'Run a vegetation index for this farm in the left panel first (▶ Run (Demo data)) — per-plot stats reuse that result.',
-      'error');
-    return;
-  }
-  const statsIndex = lastProcessedIndex;
-  showStatus('plots-status', `Computing per-plot ${statsIndex.toUpperCase()} stats…`, 'info');
-  const form = new FormData();
-  form.append('boundary_id', currentBoundaryId);
-  form.append('index', statsIndex);
-  try {
-    const res = await fetch(`${API_BASE}/plots/zonal-stats`, { method: 'POST', body: form });
-    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
-    const data = await res.json();
-    // color the plot outlines by mean value as a quick visual
-    const vals = data.plots.map(p => p.mean).filter(v => v !== null);
-    const vmin = Math.min(...vals), vmax = Math.max(...vals);
-    plotsEditGroup.eachLayer(layer => {
-      const pid = layer.feature.properties.plot_id;
-      const stat = data.plots.find(p => p.plot_id === pid);
-      if (stat && stat.mean !== null && vmax > vmin) {
-        const t = (stat.mean - vmin) / (vmax - vmin);
-        const r = Math.round(215 + (26 - 215) * t);
-        const g = Math.round(48 + (152 - 48) * t);
-        const b = Math.round(39 + (80 - 39) * t);
-        layer.setStyle({ fillColor: `rgb(${r},${g},${b})`, fillOpacity: 0.55, weight: 1, color: '#1a1f1c' });
-        layer.bindTooltip(`Plot ${pid}: ${stat.mean.toFixed(3)}`);
-      } else if (stat && stat.mean === null) {
-        layer.setStyle({ fillColor: '#999', fillOpacity: 0.3, weight: 1, color: '#1a1f1c', dashArray: '2,2' });
-        layer.bindTooltip(`Plot ${pid}: no data — ${stat.no_data_reason || 'outside processed area'}`);
-      }
-    });
-    renderPlotStatsTable(data.plots, statsIndex);
-    const msg = data.no_data_count
-      ? `Stats computed for ${data.plot_count} plots — ${data.no_data_count} have no data (see table, greyed on map).`
-      : `Stats computed for ${data.plot_count} plots — colored on map and listed below.`;
-    showStatus('plots-status', msg, data.no_data_count ? 'info' : 'success');
-  } catch (err) {
-    showStatus('plots-status', `Error: ${err.message}`, 'error');
-  }
-};
-
-function renderPlotStatsTable(plots, indexKey) {
-  const wrap = document.getElementById('plot-stats-table-wrap');
-  const tbody = document.querySelector('#plot-stats-table tbody');
-  tbody.innerHTML = '';
-  plots.slice().sort((a, b) => a.plot_id - b.plot_id).forEach(p => {
-    const tr = document.createElement('tr');
-    const fmt = v => (v === null || v === undefined) ? '–' : Number(v).toFixed(3);
-    const meanCell = p.mean === null
-      ? `<span title="${p.no_data_reason || 'no data'}" style="color:var(--danger); cursor:help;">– ⚠</span>`
-      : fmt(p.mean);
-    tr.innerHTML = `<td>${p.plot_id}</td><td>${p.row}</td><td>${p.col}</td>` +
-      `<td>${p.area_m2 ?? '–'}</td><td>${meanCell}</td><td>${fmt(p.min)}</td>` +
-      `<td>${fmt(p.max)}</td><td>${fmt(p.std)}</td>`;
-    tbody.appendChild(tr);
-  });
-  wrap.style.display = plots.length ? 'block' : 'none';
-  document.getElementById('plot-stats-caption').textContent =
-    plots.length ? `${plots.length} plots — ${indexKey.toUpperCase()} (hover ⚠ for why a plot has no data)` : '';
-}
-
 document.getElementById('btn-classify-zones').onclick = async () => {
-  if (!currentBoundaryId) { showStatus('plots-status', 'Import or draw a farm boundary first.', 'error'); return; }
+  if (!currentBoundaryId) { showStatus('zones-status', 'Import or draw a farm boundary first.', 'error'); return; }
   const nZones = document.getElementById('n-zones').value;
-  showStatus('plots-status', `Classifying ${nZones} management zones…`, 'info');
+  showStatus('zones-status', `Classifying ${nZones} management zones…`, 'info');
   const form = new FormData();
   form.append('boundary_id', currentBoundaryId);
   form.append('index', selectedIndex);
@@ -976,9 +735,9 @@ document.getElementById('btn-classify-zones').onclick = async () => {
     const data = await res.json();
     drawZonesOnMap(data.zones, parseInt(nZones));
     renderRatePlan(data.rate_plan, data.zones);
-    showStatus('plots-status', `${data.zones.length} zones classified.`, 'success');
+    showStatus('zones-status', `${data.zones.length} zones classified.`, 'success');
   } catch (err) {
-    showStatus('plots-status', `Error: ${err.message}`, 'error');
+    showStatus('zones-status', `Error: ${err.message}`, 'error');
   }
 };
 
@@ -1010,21 +769,13 @@ document.getElementById('exp-pdf').onclick = () => {
   if (!currentBoundaryId) { showStatus('export-status', 'Load a farm first.', 'error'); return; }
   downloadFrom(`${API_BASE}/export/pdf?boundary_id=${currentBoundaryId}&index=${selectedIndex}`);
 };
-document.getElementById('exp-excel').onclick = () => {
-  if (!currentBoundaryId) { showStatus('export-status-plots', 'Load a farm first.', 'error'); return; }
-  downloadFrom(`${API_BASE}/export/excel/plots?boundary_id=${currentBoundaryId}&index=${selectedIndex}`);
-};
-document.getElementById('exp-shp-plots').onclick = () => {
-  if (!currentBoundaryId) { showStatus('export-status-plots', 'Load a farm first.', 'error'); return; }
-  downloadFrom(`${API_BASE}/export/shp/plots?boundary_id=${currentBoundaryId}`);
-};
 document.getElementById('exp-shp-zones').onclick = () => {
-  if (!currentBoundaryId) { showStatus('export-status-plots', 'Load a farm first.', 'error'); return; }
+  if (!currentBoundaryId) { showStatus('zones-status', 'Load a farm first.', 'error'); return; }
   const nZones = document.getElementById('n-zones').value;
   downloadFrom(`${API_BASE}/export/shp/zones?boundary_id=${currentBoundaryId}&index=${selectedIndex}&n_zones=${nZones}`);
 };
 document.getElementById('btn-share').onclick = async () => {
-  if (!currentBoundaryId) { showStatus('export-status-plots', 'Load a farm first.', 'error'); return; }
+  if (!currentBoundaryId) { showStatus('export-status', 'Load a farm first.', 'error'); return; }
   const form = new FormData();
   form.append('boundary_id', currentBoundaryId);
   form.append('index', selectedIndex);
@@ -1033,125 +784,14 @@ document.getElementById('btn-share').onclick = async () => {
     const data = await res.json();
     const fullUrl = `${API_BASE}${data.share_path}`;
     await navigator.clipboard.writeText(fullUrl).catch(() => {});
-    showStatus('export-status-plots', `Share link copied: ${fullUrl}`, 'success');
+    showStatus('export-status', `Share link copied: ${fullUrl}`, 'success');
   } catch (err) {
-    showStatus('export-status-plots', `Error: ${err.message}`, 'error');
+    showStatus('export-status', `Error: ${err.message}`, 'error');
   }
 };
 
 // =====================================================================
-// 6. Drone plant count
-// =====================================================================
-let droneFileId = null;
-let droneImageOverlay = null;
-
-document.getElementById('btn-drone-upload').onclick = async () => {
-  const fileInput = document.getElementById('drone-file-input');
-  if (!fileInput.files[0]) { showStatus('drone-status', 'Choose a .tif file first.', 'error'); return; }
-  showStatus('drone-status', 'Uploading & inspecting orthomosaic…', 'info');
-  const form = new FormData();
-  form.append('file', fileInput.files[0]);
-  try {
-    const res = await fetch(`${API_BASE}/drone/upload`, { method: 'POST', body: form });
-    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
-    const data = await res.json();
-    droneFileId = data.drone_file_id;
-    document.getElementById('btn-plant-count').disabled = false;
-    document.getElementById('btn-plant-count-per-plot').disabled = false;
-
-    // show the uploaded image on the map so there's visual confirmation it loaded
-    if (droneImageOverlay) map.removeLayer(droneImageOverlay);
-    const [west, south, east, north] = data.bounds_wgs84;
-    const overlayBounds = [[south, west], [north, east]];
-    droneImageOverlay = L.imageOverlay(
-      `data:image/png;base64,${data.preview_png_base64}`, overlayBounds, { opacity: 0.95 }
-    ).addTo(map);
-    map.fitBounds(overlayBounds);
-    const toggleBtn = document.getElementById('btn-toggle-drone-overlay');
-    toggleBtn.style.display = 'inline-flex';
-    toggleBtn.textContent = '🖼 Hide image on map';
-    toggleBtn.dataset.visible = 'true';
-
-    showStatus('drone-status',
-      `Loaded: ${data.width}×${data.height}px, ${data.band_count} band(s), ~${(data.resolution_m[0]*100).toFixed(1)}cm/px — shown on map.`,
-      'success');
-  } catch (err) {
-    showStatus('drone-status', `Error: ${err.message}`, 'error');
-  }
-};
-
-document.getElementById('btn-toggle-drone-overlay').onclick = () => {
-  const btn = document.getElementById('btn-toggle-drone-overlay');
-  if (!droneImageOverlay) return;
-  const visible = btn.dataset.visible === 'true';
-  if (visible) {
-    map.removeLayer(droneImageOverlay);
-    btn.textContent = '🖼 Show image on map';
-    btn.dataset.visible = 'false';
-  } else {
-    droneImageOverlay.addTo(map);
-    btn.textContent = '🖼 Hide image on map';
-    btn.dataset.visible = 'true';
-  }
-};
-
-document.getElementById('btn-plant-count').onclick = async () => {
-  if (!droneFileId) return;
-  showStatus('drone-status', 'Detecting plants…', 'info');
-  const form = new FormData();
-  form.append('drone_file_id', droneFileId);
-  if (currentBoundaryId) form.append('boundary_id', currentBoundaryId);
-  try {
-    const res = await fetch(`${API_BASE}/drone/plant-count`, { method: 'POST', body: form });
-    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
-    const data = await res.json();
-    showStatus('drone-status', `Detected ${data.plant_count} plants.`, 'success');
-    document.getElementById('drone-result').textContent = data.note;
-  } catch (err) {
-    showStatus('drone-status', `Error: ${err.message}`, 'error');
-  }
-};
-
-document.getElementById('btn-plant-count-per-plot').onclick = async () => {
-  if (!droneFileId) return;
-  if (!currentBoundaryId) { showStatus('drone-status', 'Import or select a boundary first.', 'error'); return; }
-  showStatus('drone-status', 'Counting plants per plot…', 'info');
-  const form = new FormData();
-  form.append('drone_file_id', droneFileId);
-  form.append('boundary_id', currentBoundaryId);
-  try {
-    const res = await fetch(`${API_BASE}/drone/plant-count-per-plot`, { method: 'POST', body: form });
-    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
-    const data = await res.json();
-    plotsEditGroup.eachLayer(layer => {
-      const pid = layer.feature.properties.plot_id;
-      const stat = data.plots.find(p => p.plot_id === pid);
-      if (stat) layer.bindTooltip(`Plot ${pid}: ${stat.plant_count} plants`);
-    });
-    renderPlantCountTable(data.plots);
-    showStatus('drone-status', `${data.total_plant_count} plants total across ${data.plot_count} plots — see table and map tooltips.`, 'success');
-  } catch (err) {
-    showStatus('drone-status', `Error: ${err.message}`, 'error');
-  }
-};
-
-function renderPlantCountTable(plots) {
-  const wrap = document.getElementById('plant-count-table-wrap');
-  const tbody = document.querySelector('#plant-count-table tbody');
-  tbody.innerHTML = '';
-  plots.slice().sort((a, b) => a.plot_id - b.plot_id).forEach(p => {
-    const tr = document.createElement('tr');
-    const canopy = (p.mean_canopy_area_m2 === null || p.mean_canopy_area_m2 === undefined) ? '–' : p.mean_canopy_area_m2.toFixed(3);
-    tr.innerHTML = `<td>${p.plot_id}</td><td>${p.row}</td><td>${p.col}</td><td>${p.plant_count}</td><td>${canopy}</td>`;
-    tbody.appendChild(tr);
-  });
-  wrap.style.display = plots.length ? 'block' : 'none';
-  document.getElementById('plant-count-caption').textContent =
-    plots.length ? `${plots.length} plots` : '';
-}
-
-// =====================================================================
-// 6b. Field monitoring: timeline, alerts, problem areas, plot ranking, rate plan
+// 6b. Field monitoring: timeline, alerts, problem areas, rate plan
 // =====================================================================
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1286,35 +926,6 @@ function renderProblemAreas(data) {
   });
   map.fitBounds(problemLayer.getBounds().pad(1.5));
 }
-
-document.getElementById('btn-plot-rank').onclick = async () => {
-  if (!currentBoundaryId) { showStatus('plots-status', 'Import or draw a farm boundary first.', 'error'); return; }
-  showStatus('plots-status', 'Ranking plots…', 'info');
-  const form = new FormData();
-  form.append('boundary_id', currentBoundaryId); form.append('index', selectedIndex);
-  try {
-    const res = await fetch(`${API_BASE}/plots/performance`, { method: 'POST', body: form });
-    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
-    const data = await res.json();
-    const tbody = document.querySelector('#plot-rank-table tbody');
-    tbody.innerHTML = '';
-    const flagStyle = { underperforming: 'color:var(--danger); font-weight:700;', watch: 'color:#b27d00; font-weight:600;',
-                        top: 'color:var(--green-700); font-weight:600;', ok: 'color:var(--muted);' };
-    data.plots.forEach(p => {
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${p.rank_from_bottom}</td><td>${p.plot_id}</td><td>${p.mean.toFixed(3)}</td>` +
-        `<td>${p.vs_median >= 0 ? '+' : ''}${p.vs_median.toFixed(3)}</td><td>${p.z_score}</td><td style="${flagStyle[p.flag]}">${esc(p.flag)}</td>`;
-      tbody.appendChild(tr);
-    });
-    document.getElementById('plot-rank-wrap').style.display = 'block';
-    const sm = data.summary;
-    document.getElementById('plot-rank-caption').textContent =
-      `Weakest first. ${sm.underperforming} underperforming, ${sm.watch} on watch · field uniformity CV ${sm.uniformity_cv_pct}% · ` +
-      `headroom median→top quartile ${sm.headroom_median_to_top_quartile}` +
-      (sm.unranked_no_data ? ` · ${sm.unranked_no_data} plot(s) had no data` : '');
-    showStatus('plots-status', `Ranked ${sm.plots_ranked} plots against the field baseline.`, 'success');
-  } catch (err) { showStatus('plots-status', `Error: ${err.message}`, 'error'); }
-};
 
 function renderRatePlan(plan, zones) {
   const box = document.getElementById('zone-plan-box');
@@ -1477,7 +1088,7 @@ function showSignIn(message) {
 
 const PLAN_WORDS = { standard: 'Standard', advanced: 'Advanced', custom: 'Custom' };
 const FEATURE_WORDS = { monitoring: 'Satellite monitoring', zones: 'Management zones', suitability: 'Crop suitability',
-  drone: 'Drone imagery', plant_count: 'Plant counts', prescriptions: 'Variable-rate prescriptions' };
+  prescriptions: 'Variable-rate prescriptions', alerts: 'Weekly farm alerts', verification: 'Farm verification reports' };
 const APP_WORDS = { hub: 'Field data, maps and dashboards', land: 'Parcels, titles and the land register',
   check: 'Location reports', farm: 'Satellite farm monitoring' };
 
@@ -1557,6 +1168,303 @@ function applyPlan() {
   applyPlan();
   await loadFarms();
 })();
+
+// =====================================================================
+// Many farms: farms from Geohub, the portfolio, scouting tasks to Geohub
+// =====================================================================
+const NDVI_COLOR = v => v == null ? '#9aa5a0' : v < 0.2 ? '#b3462c' : v < 0.35 ? '#e08a2c' : v < 0.5 ? '#d6c23a' : v < 0.65 ? '#6a9f3a' : '#2c7a45';
+let portfolioLayer = null;
+
+async function showFarmDetails(f) {
+  const box = document.getElementById('farm-details');
+  const d = f.details || {};
+  const bits = [d.farmer_name && `Farmer: <b>${esc(d.farmer_name)}</b>${d.farmer_phone ? ` (${esc(d.farmer_phone)})` : ''}`,
+    d.crops && d.crops.length && `Crops: ${esc(d.crops.join(', '))}`, d.planting_date && `Planted ${esc(d.planting_date)}`,
+    d.community && `${esc([d.community, d.lga, d.state].filter(Boolean).join(', '))}`,
+    d.declared_ha && `Farmer gives ${esc(d.declared_ha)} ha (measured ${esc(f.area_ha)} ha)`,
+    f.source === 'geohub' && d.collected_by && `Mapped in Geohub by ${esc(d.collected_by)}`].filter(Boolean);
+  box.innerHTML = bits.join(' · ');
+  box.style.display = bits.length ? 'block' : 'none';
+}
+const _openFarm = openFarm;
+openFarm = async function (id) {
+  if (portfolioLayer) { map.removeLayer(portfolioLayer); portfolioLayer = null; }
+  await _openFarm(id);
+  const res = await fetch(`${API_BASE}/boundary/${id}`);
+  if (res.ok) showFarmDetails(await res.json());
+  document.getElementById('scout-box').style.display = 'none';
+};
+
+document.getElementById('btn-import-geohub').onclick = async () => {
+  const box = document.getElementById('geohub-import');
+  if (box.style.display === 'block') { box.style.display = 'none'; return; }
+  box.style.display = 'block';
+  const sel = document.getElementById('geohub-enum-form');
+  sel.innerHTML = '<option>Loading your Geohub forms…</option>';
+  const res = await fetch(`${API_BASE}/geohub/forms?template=farm_enumeration`);
+  const forms = res.ok ? await res.json() : [];
+  sel.innerHTML = forms.length ? forms.map(f => `<option value="${esc(f.form_id)}">${esc(f.name)} — ${esc(f.project_name)} (${f.features} records)</option>`).join('')
+    : '<option value="">No Farm enumeration form yet: in Geohub, add a form and start from "Farm enumeration"</option>';
+  if (!res.ok) showStatus('boundary-status', (await res.json().catch(() => ({}))).detail || 'Geohub could not be reached.', 'error');
+};
+document.getElementById('btn-run-import').onclick = async () => {
+  const id = document.getElementById('geohub-enum-form').value;
+  if (!id) return;
+  showStatus('boundary-status', 'Bringing in farms from Geohub…', 'info');
+  const form = new FormData(); form.append('form_id', id);
+  const res = await fetch(`${API_BASE}/enumeration/import`, { method: 'POST', body: form });
+  const r = await res.json();
+  if (!res.ok) { showStatus('boundary-status', r.detail || 'Could not bring them in.', 'error'); return; }
+  const probs = r.problems.length ? ` ${r.problems.length} not added: ` + r.problems.slice(0, 4).map(p => `#${p.record} ${p.farm} (${p.problem})`).join('; ') + (r.problems.length > 4 ? '…' : '') : '';
+  showStatus('boundary-status', `${r.added.length} farm(s) added, ${r.already_here} already here.${probs}`, r.problems.length ? 'info' : 'success');
+  if (ME) { ME.hectares_used = r.hectares_used; renderAccount(); }
+  await loadFarms();
+};
+
+document.getElementById('btn-portfolio').onclick = async () => {
+  showStatus('boundary-status', 'Loading all farms…', 'info');
+  const res = await fetch(`${API_BASE}/portfolio?index=ndvi`);
+  if (!res.ok) { showStatus('boundary-status', (await res.json()).detail || 'Could not load the farms.', 'error'); return; }
+  const p = await res.json();
+  if (!p.farms.length) { showStatus('boundary-status', 'No farms yet.', 'info'); return; }
+  currentBoundaryId = null; drawnItems.clearLayers();
+  if (overlayLayer) { map.removeLayer(overlayLayer); overlayLayer = null; }
+  if (portfolioLayer) map.removeLayer(portfolioLayer);
+  portfolioLayer = L.geoJSON(p.farms.map(f => ({ type: 'Feature', properties: f, geometry: f.geometry })), {
+    style: ft => ({ color: '#ffffff', weight: 1.5, fillColor: NDVI_COLOR(ft.properties.latest && ft.properties.latest.mean), fillOpacity: 0.7 }),
+  }).addTo(map);
+  portfolioLayer.eachLayer(l => {
+    const f = l.feature.properties;
+    l.bindTooltip(`${esc(f.name)}: ${f.latest ? `NDVI ${f.latest.mean} (${esc(f.latest.obs_date)})` : 'no image yet'}${f.alert ? ' · dropping' : ''}`);
+    l.on('click', () => openFarm(f.id));
+  });
+  map.fitBounds(portfolioLayer.getBounds().pad(0.1));
+  const rows = p.farms.map(f => `<div class="pf-row" data-id="${esc(f.id)}">
+      <span>#${f.rank}</span>
+      <span><span class="health-dot" style="background:${NDVI_COLOR(f.latest && f.latest.mean)}"></span><b>${esc(f.name)}</b>
+        <div class="meta">${f.area_ha} ha${f.farmer ? ' · ' + esc(f.farmer) : ''}${f.crops.length ? ' · ' + esc(f.crops.join(', ')) : ''}</div></span>
+      <span style="text-align:right;">${f.latest ? `NDVI <b>${f.latest.mean}</b><div class="meta">${esc(f.latest.obs_date)}</div>` : '<span class="meta">no image yet</span>'}
+        ${f.alert ? '<div class="alert">dropping</div>' : ''}${f.open_tasks ? `<div class="meta">${f.open_tasks} to scout</div>` : ''}</span>
+    </div>`).join('');
+  const list = document.getElementById('farm-list');
+  list.innerHTML = `<div class="hint" style="margin:0 0 8px;"><b>${p.farm_count}</b> farms · ${p.hectares.toLocaleString()} ha · <b>${p.with_alerts}</b> dropping · ${p.without_images} without an image yet. Weakest first; click one to open it.</div>${rows}`;
+  list.querySelectorAll('.pf-row').forEach(el => el.onclick = () => openFarm(el.dataset.id));
+  document.getElementById('farm-details').style.display = 'none';
+  document.getElementById('boundary-status').className = 'status-msg';
+};
+
+async function scoutingSetup() {
+  const res = await fetch(`${API_BASE}/settings`);
+  const st = res.ok ? await res.json() : {};
+  const box = document.getElementById('scouting-setup');
+  if (st.scouting_form) { box.style.display = 'block'; box.innerHTML = `Scouts answer in Geohub: <b>${esc(st.scouting_form_name)}</b>.`; return st; }
+  box.style.display = 'block';
+  if (!ME || ME.role !== 'manager') { box.innerHTML = 'A manager of your organization chooses the Geohub scouting form once.'; return st; }
+  const fr = await fetch(`${API_BASE}/geohub/forms?template=farm_scouting`);
+  const forms = fr.ok ? await fr.json() : [];
+  box.innerHTML = forms.length
+    ? `Choose the Geohub form scouts answer in: <select id="scout-form-pick">${forms.map(f => `<option value="${esc(f.form_id)}">${esc(f.name)} — ${esc(f.project_name)}</option>`).join('')}</select>
+       <button class="btn btn-secondary" id="btn-scout-form-save" style="margin-top:6px;">Use this form</button>`
+    : 'First, in Geohub, add a form to the project your scouts use and start it from "Farm scouting"; publish it, then come back here.';
+  const save = document.getElementById('btn-scout-form-save');
+  if (save) save.onclick = async () => {
+    const form = new FormData(); form.append('form_id', document.getElementById('scout-form-pick').value);
+    const r = await fetch(`${API_BASE}/settings/scouting`, { method: 'PUT', body: form });
+    if (!r.ok) { showStatus('monitor-status', (await r.json()).detail, 'error'); return; }
+    await scoutingSetup();
+  };
+  return st;
+}
+
+function renderTasks(data, fresh) {
+  const box = document.getElementById('scout-box');
+  box.style.display = 'block';
+  if (!data.tasks.length) { box.innerHTML = '<div class="hint">No scouting tasks for this farm.</div>'; return; }
+  const words = { open: 'to visit', found: 'found', unreachable: 'could not reach' };
+  const rows = data.tasks.map(t => {
+    const f = t.findings || {};
+    const found = t.status === 'found' ? `<div><b>${esc((f.causes || []).join(', ') || 'Nothing recorded')}</b>${f.severity ? ' · ' + esc(f.severity) : ''}${f.affected_pct != null ? ` · ${esc(f.affected_pct)}% affected` : ''}${f.photos ? ` · ${f.photos} photo(s) in Geohub` : ''}</div>${f.notes ? `<div class="meta">${esc(f.notes)}</div>` : ''}<div class="meta">${esc(f.scout || '')}${f.reviewed ? ' · reviewed' : ''}</div>` : '';
+    return `<div class="task-row ${t.status}"><span class="ref">#${t.rank} ${esc(t.ref)}</span> · ${words[t.status] || esc(t.status)}
+      <div class="meta">${esc(t.seen)}</div>${found}
+      ${t.status === 'open' ? `<a href="${esc(t.link)}" target="_blank" rel="noopener">Open in Geohub</a>` : ''}</div>`;
+  }).join('');
+  const msg = data.message ? `<button class="btn btn-secondary" id="btn-copy-tasks" style="margin-bottom:6px;">Copy the links for WhatsApp</button>
+     <a class="btn btn-secondary" style="display:block; text-align:center; text-decoration:none; margin-bottom:8px;" target="_blank" rel="noopener"
+        href="https://wa.me/?text=${encodeURIComponent(data.message)}">Share on WhatsApp</a>` : '';
+  box.innerHTML = `${fresh ? `<div class="hint">${data.tasks.length} task(s) made; earlier open tasks for this farm were replaced.</div>` : ''}${msg}${rows}`;
+  const copy = document.getElementById('btn-copy-tasks');
+  if (copy) copy.onclick = async () => { try { await navigator.clipboard.writeText(data.message); copy.textContent = 'Copied'; } catch { prompt('Copy the links:', data.message); } };
+}
+
+document.getElementById('btn-send-scouts').onclick = async () => {
+  if (!currentBoundaryId) { showStatus('monitor-status', 'Open a farm first.', 'error'); return; }
+  if (lastProcessedBoundaryId !== currentBoundaryId || lastProcessedIndex !== selectedIndex) {
+    showStatus('monitor-status', `Run ${selectedIndex.toUpperCase()} for this farm first (steps 1–3, then ▶ Run).`, 'error'); return;
+  }
+  const st = await scoutingSetup();
+  if (!st.scouting_form) return;
+  showStatus('monitor-status', 'Making scouting tasks…', 'info');
+  const form = new FormData();
+  form.append('boundary_id', currentBoundaryId); form.append('index', selectedIndex);
+  form.append('sensitivity', document.getElementById('scout-sensitivity').value);
+  const res = await fetch(`${API_BASE}/scouting/tasks`, { method: 'POST', body: form });
+  const data = await res.json();
+  if (!res.ok) { showStatus('monitor-status', data.detail || 'Could not make the tasks.', 'error'); return; }
+  document.getElementById('monitor-status').className = 'status-msg';
+  renderTasks(data, true);
+};
+
+document.getElementById('btn-scout-answers').onclick = async () => {
+  if (!currentBoundaryId) { showStatus('monitor-status', 'Open a farm first.', 'error'); return; }
+  showStatus('monitor-status', 'Reading the scouts\' answers from Geohub…', 'info');
+  const r = await fetch(`${API_BASE}/scouting/refresh`, { method: 'POST' });
+  const out = await r.json();
+  if (!r.ok && out.code !== 'no_scouting_form') { showStatus('monitor-status', out.detail || 'Geohub could not be reached.', 'error'); return; }
+  const res = await fetch(`${API_BASE}/scouting/tasks?boundary_id=${currentBoundaryId}`);
+  if (res.ok) renderTasks(await res.json(), false);
+  showStatus('monitor-status', r.ok ? `${out.tasks_updated} task(s) updated from ${out.records_read} scouting record(s).` : out.detail, r.ok ? 'success' : 'info');
+};
+
+// =====================================================================
+// The season: build it from the satellites, read green-up / peak / harvest
+// =====================================================================
+(function seasonDates() {
+  const end = new Date(), start = new Date(Date.now() - 270 * 864e5);
+  document.getElementById('season-end').value = end.toISOString().slice(0, 10);
+  document.getElementById('season-start').value = start.toISOString().slice(0, 10);
+})();
+
+function seasonChart(series) {
+  const nd = series.ndvi.filter(p => p.value != null), rv = series.rvi.filter(p => p.value != null);
+  const all = [...nd, ...rv];
+  if (!all.length) return '<div class="hint">No images in the timeline for these dates yet.</div>';
+  const t = d => new Date(d).getTime();
+  const x0 = Math.min(...all.map(p => t(p.date))), x1 = Math.max(...all.map(p => t(p.date)));
+  const W = 300, H = 120, P = 22;
+  const X = d => P + (W - 2 * P) * ((t(d) - x0) / Math.max(1, x1 - x0));
+  const Y = (v, lo, hi) => H - P - (H - 2 * P) * ((v - lo) / Math.max(1e-6, hi - lo));
+  const line = (pts, lo, hi) => pts.map((p, i) => `${i ? 'L' : 'M'}${X(p.date).toFixed(1)},${Y(p.value, lo, hi).toFixed(1)}`).join(' ');
+  const ndUsed = nd.filter(p => p.used);
+  const rlo = Math.min(...rv.map(p => p.value), 0), rhi = Math.max(...rv.map(p => p.value), 1);
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="NDVI and radar over the season" style="background:#f7f9f8; border-radius:8px;">
+    <path d="${line(ndUsed, 0, 1)}" fill="none" stroke="#2c7a45" stroke-width="2"/>
+    ${nd.map(p => `<circle cx="${X(p.date).toFixed(1)}" cy="${Y(p.value, 0, 1).toFixed(1)}" r="2.5" fill="${p.used ? '#2c7a45' : '#fff'}" stroke="#2c7a45"><title>${esc(p.date)} NDVI ${p.value}${p.used ? '' : ' (cloudy, not used)'}</title></circle>`).join('')}
+    <path d="${line(rv, rlo, rhi)}" fill="none" stroke="#6b5bd2" stroke-width="1.5" stroke-dasharray="4,3"/>
+    ${rv.map(p => `<circle cx="${X(p.date).toFixed(1)}" cy="${Y(p.value, rlo, rhi).toFixed(1)}" r="2" fill="#6b5bd2"><title>${esc(p.date)} radar RVI ${p.value}</title></circle>`).join('')}
+    <text x="${P}" y="12" font-size="9" fill="#2c7a45">● NDVI (hollow: cloudy)</text><text x="${W - P}" y="12" font-size="9" fill="#6b5bd2" text-anchor="end">- - radar RVI</text>
+    <text x="${P}" y="${H - 6}" font-size="8" fill="#5c6b62">${esc(new Date(x0).toISOString().slice(0, 10))}</text>
+    <text x="${W - P}" y="${H - 6}" font-size="8" fill="#5c6b62" text-anchor="end">${esc(new Date(x1).toISOString().slice(0, 10))}</text></svg>`;
+}
+
+function renderSeason(s) {
+  const box = document.getElementById('season-box');
+  box.style.display = 'block';
+  const pm = x => x && x.plus_minus_days != null ? ` <span class="area">±${x.plus_minus_days} d</span>` : '';
+  let read;
+  if (!s.based_on) {
+    const why = [s.optical.reason, s.radar.reason].filter(Boolean).map(esc).join(' ');
+    read = `<div class="hint">No season reading yet. ${why}</div>`;
+  } else {
+    read = `<table class="data-table" style="margin-top:8px;"><tbody>
+      <tr><td>Sown (estimate)</td><td>${s.planting ? `${esc(s.planting.from)} to ${esc(s.planting.to)}` : esc(s.greenup_note || '—')}</td></tr>
+      <tr><td>Green-up</td><td>${s.greenup ? esc(s.greenup.date) + pm(s.greenup) : esc(s.greenup_note || '—')}</td></tr>
+      <tr><td>Peak</td><td>${s.peak ? esc(s.peak.date) + pm(s.peak) : '—'}</td></tr>
+      <tr><td>Harvest or dry-down</td><td>${s.end ? esc(s.end.date) + pm(s.end) : esc(s.end_note || '—')}</td></tr>
+    </tbody></table>
+    <div class="hint">Read from ${s.based_on === 'rvi' ? 'radar (Sentinel-1)' : 'optical images (Sentinel-2 NDVI)'}. ${esc(s.note || '')} ${s.planting ? esc(s.planting.note) : ''}</div>`;
+    if (s.declared_check) read += `<div class="${s.declared_check.matches ? 'hint' : 'sample-note'}">${esc(s.declared_check.words)} (given: ${esc(s.declared_check.declared)})</div>`;
+  }
+  box.innerHTML = seasonChart(s.series) + read + (s.cloudy_images ? `<div class="hint">${s.cloudy_images} cloudy optical image(s) are shown hollow and not used.</div>` : '');
+}
+
+async function showSeason() {
+  if (!currentBoundaryId) { showStatus('monitor-status', 'Open a farm first.', 'error'); return; }
+  const q = `boundary_id=${currentBoundaryId}&start_date=${document.getElementById('season-start').value}&end_date=${document.getElementById('season-end').value}`;
+  const res = await fetch(`${API_BASE}/season?${q}`);
+  const s = await res.json();
+  if (!res.ok) { showStatus('monitor-status', s.detail || 'Could not read the season.', 'error'); return; }
+  document.getElementById('monitor-status').className = 'status-msg';
+  renderSeason(s);
+}
+document.getElementById('btn-season-show').onclick = showSeason;
+
+document.getElementById('btn-season-build').onclick = async () => {
+  if (!currentBoundaryId) { showStatus('monitor-status', 'Open a farm first.', 'error'); return; }
+  const form = new FormData();
+  form.append('boundary_id', currentBoundaryId);
+  form.append('start_date', document.getElementById('season-start').value);
+  form.append('end_date', document.getElementById('season-end').value);
+  form.append('optical', document.getElementById('season-optical').checked ? 'true' : 'false');
+  form.append('radar', document.getElementById('season-radar').checked ? 'true' : 'false');
+  const res = await fetch(`${API_BASE}/season/build`, { method: 'POST', body: form });
+  let job = await res.json();
+  if (!res.ok) { showStatus('monitor-status', job.detail || 'Could not start.', 'error'); return; }
+  const farm = currentBoundaryId;
+  while (job.status === 'queued' || job.status === 'running') {
+    showStatus('monitor-status', `Building the season… ${job.progress}% ${job.message ? '· ' + job.message : ''}`, 'info');
+    await new Promise(r => setTimeout(r, 3000));
+    const r = await fetch(`${API_BASE}/season/jobs/${job.id}`);
+    if (!r.ok) break;
+    job = await r.json();
+  }
+  showStatus('monitor-status', job.message || job.status, job.status === 'done' ? 'success' : 'error');
+  if (job.status === 'done' && currentBoundaryId === farm) await showSeason();
+};
+
+// =====================================================================
+// Weekly alerts, verification reports
+// =====================================================================
+const ALERT_ICON = { dry_spell: '☀', heavy_rain: '🌧', heat: '🌡', fire: '🔥', crop_drop: '📉' };
+let alertsSubscribed = false;
+function setSubButton() {
+  document.getElementById('btn-alerts-sub').textContent = alertsSubscribed ? '✉ Stop the weekly email' : '✉ Email me these every week';
+}
+document.getElementById('btn-alerts').onclick = async () => {
+  showStatus('alerts-status', 'Checking every farm…', 'info');
+  const res = await fetch(`${API_BASE}/alerts`);
+  const a = await res.json();
+  if (!res.ok) { showStatus('alerts-status', a.detail || 'Could not check.', 'error'); return; }
+  alertsSubscribed = a.subscribed; setSubButton();
+  const box = document.getElementById('alerts-box');
+  box.style.display = 'block';
+  const farms = a.farms.map(f => `<div class="task-row"><b class="ref" style="cursor:pointer" data-id="${esc(f.boundary_id)}">${esc(f.name)}</b>
+      ${f.alerts.map(x => `<div style="margin-top:4px;">${ALERT_ICON[x.kind] || '•'} ${esc(x.words)}</div>`).join('')}</div>`).join('');
+  box.innerHTML = `<div class="hint" style="margin:0 0 6px;">${a.alert_count} alert(s) on ${a.farms.length} of ${a.farms_checked} farms.${a.unavailable.length ? ' Not checked: ' + esc(a.unavailable.join(', ')) + '.' : ''}</div>${farms || '<div class="hint">Nothing to flag this week.</div>'}
+    ${a.subscribed && !a.email_set_up ? '<div class="sample-note">Email is not set up on this FarmScan yet, so the weekly email is not being sent.</div>' : ''}
+    <div class="hint">Weather is modelled for the area, not measured on the farm; a fire detection may be nearby burning. Prompts to check, not diagnoses.</div>`;
+  box.querySelectorAll('[data-id]').forEach(el => el.onclick = () => openFarm(el.dataset.id));
+  document.getElementById('alerts-status').className = 'status-msg';
+};
+document.getElementById('btn-alerts-sub').onclick = async () => {
+  const res = await fetch(`${API_BASE}/alerts/subscribe`, { method: alertsSubscribed ? 'DELETE' : 'POST' });
+  const r = await res.json();
+  if (!res.ok) { showStatus('alerts-status', r.detail || 'Could not change it.', 'error'); return; }
+  alertsSubscribed = r.subscribed; setSubButton();
+  showStatus('alerts-status', r.subscribed ? `The weekly alerts will be emailed to ${r.email}.` : 'The weekly email is stopped.', 'success');
+};
+
+async function loadReports() {
+  const box = document.getElementById('reports-box');
+  if (!currentBoundaryId || !ME || !ME.features.includes('verification')) { box.innerHTML = ''; return; }
+  const res = await fetch(`${API_BASE}/reports?boundary_id=${currentBoundaryId}`);
+  const list = res.ok ? await res.json() : [];
+  box.innerHTML = list.map(r => `<div class="farm-item" style="display:flex; justify-content:space-between;">
+      <span>${esc(r.code)}<span class="area" style="display:block;">${esc(new Date(r.created_at).toLocaleDateString('en-GB'))} · ${esc(r.created_by || '')}</span></span>
+      <a href="${API_BASE}/reports/${esc(r.id)}/pdf" target="_blank" rel="noopener">PDF</a></div>`).join('');
+}
+const _openFarm2 = openFarm;
+openFarm = async function (id) { await _openFarm2(id); loadReports(); };
+document.getElementById('btn-verify-report').onclick = async () => {
+  if (!currentBoundaryId) { showStatus('report-status', 'Open a farm first.', 'error'); return; }
+  showStatus('report-status', 'Issuing the report…', 'info');
+  const form = new FormData(); form.append('boundary_id', currentBoundaryId);
+  const res = await fetch(`${API_BASE}/reports/verification`, { method: 'POST', body: form });
+  const r = await res.json();
+  if (!res.ok) { showStatus('report-status', r.detail || 'Could not issue it.', 'error'); return; }
+  showStatus('report-status', `Report ${r.code} issued.${r.warnings.length ? ' ' + r.warnings.join(' ') : ''}`, r.warnings.length ? 'info' : 'success');
+  window.open(r.pdf, '_blank');
+  loadReports();
+};
 </script>
 </body>
 </html>

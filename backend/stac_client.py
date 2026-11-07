@@ -159,6 +159,36 @@ def search_scenes_detailed(geojson_geometry: dict, start_date: str, end_date: st
     return {"scenes": results, "checked": len(candidates), "fully_covering": n_covering}
 
 
+def covering_scenes(geojson_geometry: dict, start_date: str, end_date: str, max_cloud_cover: float = 70.0,
+                    limit: int = 60) -> list[dict]:
+    """Every Sentinel-2 scene in the dates that covers the whole farm, oldest first (one per date: where two tiles
+    cover it on the same day, the clearer is kept), signed, with band links and reflectance offset. For building a
+    season: the per-pixel cloud mask, not the scene's cloud cover, decides what each image is worth."""
+    import planetary_computer
+    from pystac_client import Client
+
+    catalog = Client.open(STAC_API_URL)
+    search = catalog.search(collections=[COLLECTION], intersects=geojson_geometry, datetime=f"{start_date}/{end_date}",
+                            query={"eo:cloud_cover": {"lt": max_cloud_cover}}, max_items=400)
+    by_day: dict[str, dict] = {}
+    for item in search.items():
+        if coverage_fraction(item.geometry, geojson_geometry) < MIN_COVERAGE:
+            continue
+        day = (item.properties.get("datetime") or "")[:10]
+        cc = item.properties.get("eo:cloud_cover")
+        cur = by_day.get(day)
+        if cur is None or (cc if cc is not None else 101) < (cur["cloud_cover"] if cur["cloud_cover"] is not None else 101):
+            by_day[day] = {"item": item, "date": day, "cloud_cover": cc}
+    chosen = [by_day[d] for d in sorted(by_day)][-max(1, int(limit)):]
+    out = []
+    for c in chosen:
+        signed = planetary_computer.sign(c["item"])
+        out.append({"scene_id": signed.id, "date": c["date"], "cloud_cover": c["cloud_cover"],
+                    "hrefs": {role: signed.assets[key].href for role, key in ASSET_MAP.items() if key in signed.assets},
+                    "offset": _reflectance_offset(signed)})
+    return out
+
+
 def search_scenes(geojson_geometry: dict, start_date: str, end_date: str,
                   max_cloud_cover: float = 30.0, limit: int = MAX_SCENES_DEFAULT) -> list[dict]:
     """Convenience wrapper returning just the scene list (see search_scenes_detailed)."""
