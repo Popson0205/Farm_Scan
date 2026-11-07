@@ -5,7 +5,8 @@ import logging
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
-from datetime import date as date_cls
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date as date_cls, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
@@ -33,6 +34,7 @@ import drone_ingest
 import annotations as annotations_mod
 import plot_import as plot_import_mod
 import monitoring as monitoring_mod
+import season as season_mod
 import soil as soil_mod
 import weather as weather_mod
 import suitability as suitability_mod
@@ -51,6 +53,9 @@ _RESULT_CACHE: dict[str, dict] = {}
 @asynccontextmanager
 async def lifespan(_app):
     db.start()
+    with db.tx() as conn:                            # jobs cut short by a restart
+        conn.execute("UPDATE season_jobs SET status = 'failed', message = 'FarmScan restarted while this ran: start it again.', "
+                     "finished_at = now() WHERE status IN ('queued', 'running')")
     soil_mod.fetch_from_bucket()
     yield
     db.pool.close()
@@ -1366,6 +1371,158 @@ def scouting_refresh(request: Request, user=Depends(need(feature="monitoring")))
                              (Jsonb(findings), status, str(f["id"]), t["id"]))
                 updated += 1
     return {"records_read": len(feats), "tasks_updated": updated}
+
+
+# ---------------------------------------------------------------------------
+# The season: NDVI from every usable Sentinel-2 image, radar from Sentinel-1, and green-up / peak / harvest
+# ---------------------------------------------------------------------------
+
+_JOBS = ThreadPoolExecutor(max_workers=2, thread_name_prefix="season")
+
+
+def _submit(fn, *args):
+    """Run a long job off the request (tests run it in place)."""
+    _JOBS.submit(fn, *args)
+
+
+def _job_update(job_id: str, **kw) -> None:
+    sets = ", ".join(f"{k} = %s" for k in kw)
+    vals = [Jsonb(v) if k == "result" else v for k, v in kw.items()]
+    with db.tx() as conn:
+        conn.execute(f"UPDATE season_jobs SET {sets}" + (", finished_at = now()" if kw.get("status") in ("done", "failed") else "")
+                     + " WHERE id = %s", (*vals, job_id))
+
+
+def _run_season_job(job_id: str) -> None:
+    try:
+        with db.tx() as conn:
+            job = conn.execute("SELECT j.*, b.geojson FROM season_jobs j JOIN boundaries b ON b.id = j.boundary_id WHERE j.id = %s",
+                               (job_id,)).fetchone()
+        if not job:
+            return
+        bid, geometry = str(job["boundary_id"]), job["geojson"]
+        start, end = job["start_date"].isoformat(), job["end_date"].isoformat()
+        _job_update(job_id, status="running", progress=2, message="Looking for images…")
+        import stac_client
+        result = {"optical": {"images": 0, "usable": 0, "failed": 0}, "radar": {"images": 0, "failed": 0}}
+        optical = stac_client.covering_scenes(geometry, start, end) if job["optical"] else []
+        radar = season_mod.radar_scenes(geometry, start, end) if job["radar"] else []
+        total = max(1, len(optical) + len(radar))
+        done = 0
+        for sc in optical:
+            try:
+                bands, meta = stac_client.fetch_and_clip_bands(sc["hrefs"], geometry, ["red", "nir"], reflectance_offset=sc["offset"])
+                arr = compute_index("ndvi", bands)
+                vf = meta.get("valid_fraction")
+                if np.isfinite(arr).any():
+                    monitoring_mod.save_observation(bid, "ndvi", sc["date"], "live", arr, scene_id=sc["scene_id"],
+                                                    cloud_cover=sc.get("cloud_cover"), valid_fraction=vf)
+                    result["optical"]["images"] += 1
+                    result["optical"]["usable"] += int((vf or 0) >= monitoring_mod.MIN_VALID_FRACTION)
+            except Exception as e:                      # one bad scene does not stop the season
+                log.warning("season job %s: optical %s failed: %s", job_id, sc.get("scene_id"), e)
+                result["optical"]["failed"] += 1
+            done += 1
+            _job_update(job_id, progress=int(5 + 90 * done / total), message=f"Optical images: {done} of {len(optical)}")
+        for sc in radar:
+            try:
+                vv, vh = season_mod.radar_arrays(sc, geometry)
+                if np.isfinite(vv).any() and np.isfinite(vh).any():
+                    field = np.isfinite(vv) | np.isfinite(vh)
+                    ok = np.isfinite(vv) & np.isfinite(vh)
+                    vf = float(ok.sum() / max(1, field.sum()))
+                    monitoring_mod.save_observation(bid, "rvi", sc["date"], "sentinel-1", season_mod.rvi(vv, vh),
+                                                    scene_id=sc["scene_id"], valid_fraction=vf)
+                    monitoring_mod.save_observation(bid, "vh_db", sc["date"], "sentinel-1", season_mod.to_db(vh),
+                                                    scene_id=sc["scene_id"], valid_fraction=vf)
+                    result["radar"]["images"] += 1
+            except Exception as e:
+                log.warning("season job %s: radar %s failed: %s", job_id, sc.get("scene_id"), e)
+                result["radar"]["failed"] += 1
+            done += 1
+            _job_update(job_id, progress=int(5 + 90 * done / total), message=f"Radar images: {done - len(optical)} of {len(radar)}")
+        _job_update(job_id, status="done", progress=100, result=result,
+                    message=f"{result['optical']['images']} optical ({result['optical']['usable']} clear enough) and "
+                            f"{result['radar']['images']} radar images added.")
+    except Exception as e:
+        log.exception("season job %s failed", job_id)
+        _job_update(job_id, status="failed", message=f"Could not build the season: {e}")
+
+
+JOB_SQL = ("SELECT id::text AS id, boundary_id::text AS boundary_id, start_date::text AS start_date, end_date::text AS end_date, "
+           "optical, radar, status, progress, message, result, created_by, created_at::text AS created_at, "
+           "finished_at::text AS finished_at FROM season_jobs ")
+
+
+@app.post("/api/season/build", summary="Fetch every usable satellite image of a farm over a date range (runs as a job)")
+def build_season(boundary_id: str = Form(...), start_date: str = Form(None), end_date: str = Form(None),
+                 optical: bool = Form(True), radar: bool = Form(True),
+                 user=Depends(need("agronomist", write=True, feature="monitoring"))):
+    """Sentinel-2 NDVI for every image that covers the farm (each pixel cloud-masked; images under 60% clear are kept
+    but not used for the reading) and Sentinel-1 radar (RVI and VH) for every pass, into the farm's timeline. Up to
+    400 days; default the last 9 months. Poll GET /api/season/jobs/{id}."""
+    farm = _farm(user, boundary_id)
+    try:
+        end = date_cls.fromisoformat(end_date) if end_date else date_cls.today()
+        start = date_cls.fromisoformat(start_date) if start_date else end - timedelta(days=270)
+    except ValueError:
+        raise HTTPException(400, "Dates are YYYY-MM-DD")
+    if not (0 < (end - start).days <= 400):
+        raise HTTPException(400, "The dates must run forwards, over at most 400 days")
+    if not (optical or radar):
+        raise HTTPException(400, "Choose optical, radar or both")
+    job_id = str(uuid.uuid4())
+    with db.tx() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (farm["id"],))
+        busy = conn.execute("SELECT 1 FROM season_jobs WHERE boundary_id = %s AND status IN ('queued', 'running')",
+                            (farm["id"],)).fetchone()
+        if busy:
+            raise Problem(409, "This farm's season is already being built. Wait for it to finish.", code="busy")
+        conn.execute("INSERT INTO season_jobs (id, org_id, boundary_id, start_date, end_date, optical, radar, created_by) "
+                     "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                     (job_id, user["org_id"], farm["id"], start, end, optical, radar, user["name"]))
+    _submit(_run_season_job, job_id)
+    return season_job(job_id, user)
+
+
+@app.get("/api/season/jobs/{job_id}")
+def season_job(job_id: str, user=Depends(reader)):
+    with db.tx() as conn:
+        row = conn.execute(JOB_SQL + "WHERE id = %s AND org_id = %s", (_uuid(job_id, "Job"), user["org_id"])).fetchone()
+    if not row:
+        raise Problem(404, "Job not found", code="not_found")
+    return row
+
+
+@app.get("/api/season", summary="The farm's season: NDVI and radar timelines, and green-up, peak and harvest")
+def season(boundary_id: str, start_date: str = None, end_date: str = None, user=Depends(need(feature="monitoring"))):
+    """Read from the images in the farm's timeline (build it first). NDVI images under 60% cloud-free are left out;
+    radar uses the farm's median RVI per pass. Sample data counts only where DEMO_TOOLS is on."""
+    farm = _farm(user, boundary_id)
+    lo, hi = (start_date or "0000-01-01")[:10], (end_date or "9999-12-31")[:10]
+
+    def series(index: str, sources: tuple[str, ...]):
+        rows = [o for o in monitoring_mod.list_observations(farm["id"], index) if o["source"] in sources and lo <= o["obs_date"] <= hi]
+        return rows
+
+    optical_sources = ("live", "demo") if settings.demo_tools else ("live",)
+    nd = series("ndvi", optical_sources)
+    rv = series("rvi", ("sentinel-1", "demo"))
+    vh = series("vh_db", ("sentinel-1", "demo"))
+    usable = [o for o in nd if (o["valid_fraction"] or 0) >= monitoring_mod.MIN_VALID_FRACTION and o["mean"] is not None]
+    reading = season_mod.season_reading([(o["obs_date"], o["mean"]) for o in usable],
+                                        [(o["obs_date"], o["median"]) for o in rv if o["median"] is not None],
+                                        (farm.get("details") or {}).get("planting_date"))
+    return {
+        "farm": farm["name"], **reading,
+        "series": {
+            "ndvi": [{"date": o["obs_date"], "value": None if o["mean"] is None else round(o["mean"], 3),
+                      "clear": round(o["valid_fraction"] or 0, 2), "used": o in usable} for o in nd],
+            "rvi": [{"date": o["obs_date"], "value": None if o["median"] is None else round(o["median"], 3)} for o in rv],
+            "vh_db": [{"date": o["obs_date"], "value": None if o["median"] is None else round(o["median"], 2)} for o in vh],
+        },
+        "cloudy_images": len(nd) - len(usable),
+    }
 
 
 app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")

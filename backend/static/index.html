@@ -287,6 +287,20 @@
       <button class="btn btn-secondary demo-only" id="btn-demo-season" style="margin-top:8px; display:none;">🧪 Practice: add a sample season (4 made-up dates)</button>
       <div id="timeline-box" style="display:none; margin-top:10px;"></div>
 
+      <div style="margin-top:16px; border-top:1px solid var(--border); padding-top:12px;">
+        <label>The season: planting and harvest</label>
+        <div class="hint" style="margin:0 0 8px;">Every usable Sentinel-2 image, plus Sentinel-1 radar that sees through rainy-season cloud, read for when the crop greened up, peaked and was harvested.</div>
+        <div style="display:flex; gap:8px;">
+          <input type="date" id="season-start" aria-label="Season from">
+          <input type="date" id="season-end" aria-label="Season to">
+        </div>
+        <label style="display:flex; gap:8px; align-items:center; font-size:12px; margin:2px 0 4px;"><input type="checkbox" id="season-optical" checked style="width:auto; margin:0;"> Optical (Sentinel-2)</label>
+        <label style="display:flex; gap:8px; align-items:center; font-size:12px; margin:0 0 8px;"><input type="checkbox" id="season-radar" checked style="width:auto; margin:0;"> Radar (Sentinel-1)</label>
+        <button class="btn btn-primary" id="btn-season-build">🛰 Build the season from satellite</button>
+        <button class="btn btn-secondary" id="btn-season-show" style="margin-top:8px;">📅 Show the season</button>
+        <div id="season-box" style="display:none; margin-top:10px;"></div>
+      </div>
+
       <div style="margin-top:16px;">
         <label>Problem-area sensitivity</label>
         <select id="scout-sensitivity">
@@ -1738,6 +1752,92 @@ document.getElementById('btn-scout-answers').onclick = async () => {
   const res = await fetch(`${API_BASE}/scouting/tasks?boundary_id=${currentBoundaryId}`);
   if (res.ok) renderTasks(await res.json(), false);
   showStatus('monitor-status', r.ok ? `${out.tasks_updated} task(s) updated from ${out.records_read} scouting record(s).` : out.detail, r.ok ? 'success' : 'info');
+};
+
+// =====================================================================
+// The season: build it from the satellites, read green-up / peak / harvest
+// =====================================================================
+(function seasonDates() {
+  const end = new Date(), start = new Date(Date.now() - 270 * 864e5);
+  document.getElementById('season-end').value = end.toISOString().slice(0, 10);
+  document.getElementById('season-start').value = start.toISOString().slice(0, 10);
+})();
+
+function seasonChart(series) {
+  const nd = series.ndvi.filter(p => p.value != null), rv = series.rvi.filter(p => p.value != null);
+  const all = [...nd, ...rv];
+  if (!all.length) return '<div class="hint">No images in the timeline for these dates yet.</div>';
+  const t = d => new Date(d).getTime();
+  const x0 = Math.min(...all.map(p => t(p.date))), x1 = Math.max(...all.map(p => t(p.date)));
+  const W = 300, H = 120, P = 22;
+  const X = d => P + (W - 2 * P) * ((t(d) - x0) / Math.max(1, x1 - x0));
+  const Y = (v, lo, hi) => H - P - (H - 2 * P) * ((v - lo) / Math.max(1e-6, hi - lo));
+  const line = (pts, lo, hi) => pts.map((p, i) => `${i ? 'L' : 'M'}${X(p.date).toFixed(1)},${Y(p.value, lo, hi).toFixed(1)}`).join(' ');
+  const ndUsed = nd.filter(p => p.used);
+  const rlo = Math.min(...rv.map(p => p.value), 0), rhi = Math.max(...rv.map(p => p.value), 1);
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="NDVI and radar over the season" style="background:#f7f9f8; border-radius:8px;">
+    <path d="${line(ndUsed, 0, 1)}" fill="none" stroke="#2c7a45" stroke-width="2"/>
+    ${nd.map(p => `<circle cx="${X(p.date).toFixed(1)}" cy="${Y(p.value, 0, 1).toFixed(1)}" r="2.5" fill="${p.used ? '#2c7a45' : '#fff'}" stroke="#2c7a45"><title>${esc(p.date)} NDVI ${p.value}${p.used ? '' : ' (cloudy, not used)'}</title></circle>`).join('')}
+    <path d="${line(rv, rlo, rhi)}" fill="none" stroke="#6b5bd2" stroke-width="1.5" stroke-dasharray="4,3"/>
+    ${rv.map(p => `<circle cx="${X(p.date).toFixed(1)}" cy="${Y(p.value, rlo, rhi).toFixed(1)}" r="2" fill="#6b5bd2"><title>${esc(p.date)} radar RVI ${p.value}</title></circle>`).join('')}
+    <text x="${P}" y="12" font-size="9" fill="#2c7a45">● NDVI (hollow: cloudy)</text><text x="${W - P}" y="12" font-size="9" fill="#6b5bd2" text-anchor="end">- - radar RVI</text>
+    <text x="${P}" y="${H - 6}" font-size="8" fill="#5c6b62">${esc(new Date(x0).toISOString().slice(0, 10))}</text>
+    <text x="${W - P}" y="${H - 6}" font-size="8" fill="#5c6b62" text-anchor="end">${esc(new Date(x1).toISOString().slice(0, 10))}</text></svg>`;
+}
+
+function renderSeason(s) {
+  const box = document.getElementById('season-box');
+  box.style.display = 'block';
+  const pm = x => x && x.plus_minus_days != null ? ` <span class="area">±${x.plus_minus_days} d</span>` : '';
+  let read;
+  if (!s.based_on) {
+    const why = [s.optical.reason, s.radar.reason].filter(Boolean).map(esc).join(' ');
+    read = `<div class="hint">No season reading yet. ${why}</div>`;
+  } else {
+    read = `<table class="data-table" style="margin-top:8px;"><tbody>
+      <tr><td>Sown (estimate)</td><td>${s.planting ? `${esc(s.planting.from)} to ${esc(s.planting.to)}` : esc(s.greenup_note || '—')}</td></tr>
+      <tr><td>Green-up</td><td>${s.greenup ? esc(s.greenup.date) + pm(s.greenup) : esc(s.greenup_note || '—')}</td></tr>
+      <tr><td>Peak</td><td>${s.peak ? esc(s.peak.date) + pm(s.peak) : '—'}</td></tr>
+      <tr><td>Harvest or dry-down</td><td>${s.end ? esc(s.end.date) + pm(s.end) : esc(s.end_note || '—')}</td></tr>
+    </tbody></table>
+    <div class="hint">Read from ${s.based_on === 'rvi' ? 'radar (Sentinel-1)' : 'optical images (Sentinel-2 NDVI)'}. ${esc(s.note || '')} ${s.planting ? esc(s.planting.note) : ''}</div>`;
+    if (s.declared_check) read += `<div class="${s.declared_check.matches ? 'hint' : 'sample-note'}">${esc(s.declared_check.words)} (given: ${esc(s.declared_check.declared)})</div>`;
+  }
+  box.innerHTML = seasonChart(s.series) + read + (s.cloudy_images ? `<div class="hint">${s.cloudy_images} cloudy optical image(s) are shown hollow and not used.</div>` : '');
+}
+
+async function showSeason() {
+  if (!currentBoundaryId) { showStatus('monitor-status', 'Open a farm first.', 'error'); return; }
+  const q = `boundary_id=${currentBoundaryId}&start_date=${document.getElementById('season-start').value}&end_date=${document.getElementById('season-end').value}`;
+  const res = await fetch(`${API_BASE}/season?${q}`);
+  const s = await res.json();
+  if (!res.ok) { showStatus('monitor-status', s.detail || 'Could not read the season.', 'error'); return; }
+  document.getElementById('monitor-status').className = 'status-msg';
+  renderSeason(s);
+}
+document.getElementById('btn-season-show').onclick = showSeason;
+
+document.getElementById('btn-season-build').onclick = async () => {
+  if (!currentBoundaryId) { showStatus('monitor-status', 'Open a farm first.', 'error'); return; }
+  const form = new FormData();
+  form.append('boundary_id', currentBoundaryId);
+  form.append('start_date', document.getElementById('season-start').value);
+  form.append('end_date', document.getElementById('season-end').value);
+  form.append('optical', document.getElementById('season-optical').checked ? 'true' : 'false');
+  form.append('radar', document.getElementById('season-radar').checked ? 'true' : 'false');
+  const res = await fetch(`${API_BASE}/season/build`, { method: 'POST', body: form });
+  let job = await res.json();
+  if (!res.ok) { showStatus('monitor-status', job.detail || 'Could not start.', 'error'); return; }
+  const farm = currentBoundaryId;
+  while (job.status === 'queued' || job.status === 'running') {
+    showStatus('monitor-status', `Building the season… ${job.progress}% ${job.message ? '· ' + job.message : ''}`, 'info');
+    await new Promise(r => setTimeout(r, 3000));
+    const r = await fetch(`${API_BASE}/season/jobs/${job.id}`);
+    if (!r.ok) break;
+    job = await r.json();
+  }
+  showStatus('monitor-status', job.message || job.status, job.status === 'done' ? 'success' : 'error');
+  if (job.status === 'done' && currentBoundaryId === farm) await showSeason();
 };
 </script>
 </body>

@@ -132,6 +132,20 @@ FarmScan is one of the GeoEstate products. It has no accounts of its own:
   collector with the farm, the task and what the satellite saw filled in and the place marked; share them on WhatsApp.
   "Check scouts' answers" reads the records back by task and shows the cause, severity and photos count per area.
 
+### The season through the clouds (Sentinel-1 radar) and planting/harvest dates
+
+- **Build the season from satellite** (`POST /api/season/build`, a background job): NDVI from *every* Sentinel-2
+  image covering the farm over the dates (each pixel cloud-masked; images under 60% clear are kept but not used), and
+  **Sentinel-1 radar** for every pass — RVI = 4·VH/(VV+VH) and VH backscatter — which cloud does not stop. From May to
+  September clouds often hide Nigerian farms from optical satellites for weeks; radar fills those gaps.
+- **The season reading** (`GET /api/season`, `backend/season.py`): green-up (20% of the season's amplitude, rising),
+  peak, and harvest or dry-down (50%, falling), the amplitude-threshold method of TIMESAT / MODIS land-cover dynamics,
+  each with its uncertainty in days (half the gap between the images around it). It uses optical NDVI unless clouds
+  left a gap around green-up that radar fills better. **Sowing** is given as a range before green-up (a crop shows from
+  space 1–4 weeks after sowing). Where a farm came from Geohub with a planting date, it is checked against this.
+- No clear crop cycle (amplitude under 0.15 NDVI / 0.10 RVI), too few images, already green at the first image, or not
+  yet harvested at the last are said as such rather than guessed.
+
 ### Deploying (Railway)
 
 The service is `backend/` (Railpack, `uvicorn main:app`), which also serves the web app. Variables:
