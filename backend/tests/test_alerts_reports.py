@@ -167,3 +167,24 @@ def test_fires_come_from_noaa20_and_noaa21(monkeypatch):
     monkeypatch.setattr(requests, "get", lambda url, timeout: R("Invalid MAP_KEY."))
     with pytest.raises(RuntimeError):
         alerts.fetch_fires(POLY)
+
+
+def test_rainy_months_from_the_real_climate_summary():
+    """weather.climate_summary names months ("Apr"); the alerts read them as numbers (this broke /api/alerts)."""
+    hist = {"dates": [], "rain": [], "tmax": [], "tmin": [], "source": "test"}
+    d = date(2016, 1, 1)
+    while d.year < 2026:
+        hist["dates"].append(d.isoformat()); hist["rain"].append(4.0 if 4 <= d.month <= 10 else 0.2)
+        hist["tmax"].append(32.0); hist["tmin"].append(22.0)
+        d += timedelta(days=1)
+    real = weather.climate_summary(hist)
+    assert alerts.wet_months_of(real) == list(range(4, 11))
+    assert alerts.wet_months_of({"wet_months": [5, 6]}) == [5, 6] and alerts.wet_months_of({}) is None
+
+
+def test_dry_down_after_the_peak_is_not_a_crop_alert():
+    trend = {"alerts": [{"obs_date": "2026-10-10", "message": "down 0.12 since the previous image"}]}
+    assert alerts.crop_alerts(trend, "ndvi", date(2026, 10, 20)) != []
+    assert alerts.crop_alerts(trend, "ndvi", date(2026, 10, 20), after_peak="2026-08-25") == []          # drying down
+    assert alerts.crop_alerts(trend, "ndvi", date(2026, 10, 20), after_peak="2026-10-15") != []          # before the peak
+    assert alerts.crop_alerts(trend, "ndvi", date(2026, 10, 5)) == []                                    # not yet happened

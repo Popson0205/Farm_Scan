@@ -97,10 +97,16 @@ def test_sample_data_only_where_switched_on():
 def test_share_links_open_without_sign_in():
     bid = add().json()["boundary_id"]
     client.post("/api/imagery/process-demo", data={"boundary_id": bid, "index": "ndvi"})
-    token = client.post("/api/share", data={"boundary_id": bid, "index": "ndvi"}).json()["token"]
+    sh = client.post("/api/share", data={"boundary_id": bid, "index": "ndvi"}).json()
+    token = sh["token"]
+    assert sh["share_url"] == f"http://farm.test/share.html?t={token}" and sh["with_result"] is True
+    main._RESULT_CACHE.clear()                                   # a restart: the shared result is kept with the link
     CURRENT["user"] = None
     r = client.get(f"/api/share/{token}")
-    assert r.status_code == 200 and r.json()["boundary"]["boundary_id"] == bid and r.json()["source"] == "demo"
+    d = r.json()
+    assert r.status_code == 200 and d["boundary"]["boundary_id"] == bid and d["source"] == "demo"
+    assert d["overlay_png_base64"] and len(d["overlay_bounds"]) == 2 and d["stats"]["pixel_count"] > 0
+    assert client.get("/share.html").status_code == 200 and client.get("/api/share/nope").status_code == 404
 
 
 def test_notes_carry_the_author():
@@ -156,3 +162,11 @@ def test_real_sign_in_checks_tokens_with_geohub(monkeypatch):
     finally:
         from conftest import _current
         main.app.dependency_overrides[identity.current_user] = _current
+
+
+def test_setup_check_says_what_is_missing():
+    CURRENT["user"] = None
+    s = client.get("/api/setup").json()
+    assert set(s["checks"]) >= {"sign_in", "email", "fires", "land_registry", "soil"}
+    assert s["checks"]["sign_in"]["ok"] is False and "ID_SECRET" in s["checks"]["sign_in"]["what"]
+    assert "secret" not in str(s).lower().replace("id_secret", "")

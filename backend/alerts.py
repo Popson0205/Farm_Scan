@@ -92,11 +92,13 @@ def fire_alerts(detections: list[dict], geometry: dict) -> list[dict]:
                       "It may be a nearby field or bush burning: check the crop and stores."}]
 
 
-def crop_alerts(trend: dict, index: str, today: date | None = None) -> list[dict]:
-    """Drops in the farm's timeline (monitoring.analyze_trend) dated in the last CROP_DAYS days."""
+def crop_alerts(trend: dict, index: str, today: date | None = None, after_peak: str | None = None) -> list[dict]:
+    """Drops in the farm's timeline (monitoring.analyze_trend) dated in the last CROP_DAYS days. Drops after the
+    season's peak (`after_peak`, a date) are the crop drying down before harvest and are not alerts."""
     today = today or date.today()
     since = (today - timedelta(days=CROP_DAYS)).isoformat()
-    recent = [a for a in trend.get("alerts", []) if a["obs_date"] >= since]
+    recent = [a for a in trend.get("alerts", []) if since <= a["obs_date"] <= today.isoformat()
+              and not (after_peak and a["obs_date"] > after_peak)]
     if not recent:
         return []
     a = recent[-1]
@@ -145,11 +147,20 @@ def email_text(org: str, farms: list[dict], link: str) -> tuple[str, str]:
     return subject, "\n".join(lines)
 
 
+MONTHS = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+
+
 def wet_months_of(climate: dict | None) -> list[int] | None:
-    if not climate:
+    """The rainy months as numbers 1-12, from weather.climate_summary (which names them "Apr", "May", …)."""
+    if not climate or not climate.get("wet_months"):
         return None
-    m = climate.get("wet_months")
-    return [int(x) for x in m] if m else None
+    out = []
+    for m in climate["wet_months"]:
+        if isinstance(m, int) or str(m).isdigit():
+            out.append(int(m))
+        elif str(m)[:3].lower() in MONTHS:
+            out.append(MONTHS[str(m)[:3].lower()])
+    return out or None
 
 
 def mean_or_none(v):

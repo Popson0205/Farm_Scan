@@ -56,6 +56,16 @@ _OFFSET_BASELINE = "04.00"
 _DEFAULT_OFFSET = -0.1
 
 
+def signed(href: str) -> str:
+    """A readable URL for a Planetary Computer asset, signed when it is read rather than when it was found: the
+    signature (a SAS token) lasts about an hour, and a season build can take longer than that. planetary_computer
+    keeps a token per storage container until it expires, so this is cheap."""
+    if not href or not href.startswith("http"):
+        return href
+    import planetary_computer
+    return planetary_computer.sign(href)
+
+
 def scl_valid_mask(scl: np.ndarray) -> np.ndarray:
     """True where the Scene Classification Layer says the pixel is a clear,
     usable observation (not cloud, cirrus, shadow, saturated, snow, no-data)."""
@@ -116,7 +126,6 @@ def search_scenes_detailed(geojson_geometry: dict, start_date: str, end_date: st
     Note: pystac-client's `limit` is the page SIZE, not a cap (iterating still walks every
     page), so the cap is `max_items` plus our own selection.
     """
-    import planetary_computer
     from pystac_client import Client
 
     catalog = Client.open(STAC_API_URL)
@@ -143,18 +152,16 @@ def search_scenes_detailed(geojson_geometry: dict, start_date: str, end_date: st
 
     results = []
     for c in chosen:
-        signed = planetary_computer.sign(c["item"])
+        item = c["item"]                       # band links are signed when read (see signed())
         results.append({
-            "scene_id": signed.id,
-            "date": signed.properties.get("datetime"),
-            "cloud_cover": signed.properties.get("eo:cloud_cover"),
+            "scene_id": item.id,
+            "date": item.properties.get("datetime"),
+            "cloud_cover": item.properties.get("eo:cloud_cover"),
             "coverage_pct": round(c["coverage"] * 100, 1),
-            "platform": signed.properties.get("platform"),
-            "thumbnail_url": signed.assets.get("rendered_preview", {}).href
-                if signed.assets.get("rendered_preview") else None,
-            "_href_cache": {role: signed.assets[key].href
-                             for role, key in ASSET_MAP.items() if key in signed.assets},
-            "_reflectance_offset": _reflectance_offset(signed),
+            "platform": item.properties.get("platform"),
+            "_href_cache": {role: item.assets[key].href
+                             for role, key in ASSET_MAP.items() if key in item.assets},
+            "_reflectance_offset": _reflectance_offset(item),
         })
     return {"scenes": results, "checked": len(candidates), "fully_covering": n_covering}
 
@@ -162,9 +169,8 @@ def search_scenes_detailed(geojson_geometry: dict, start_date: str, end_date: st
 def covering_scenes(geojson_geometry: dict, start_date: str, end_date: str, max_cloud_cover: float = 70.0,
                     limit: int = 60) -> list[dict]:
     """Every Sentinel-2 scene in the dates that covers the whole farm, oldest first (one per date: where two tiles
-    cover it on the same day, the clearer is kept), signed, with band links and reflectance offset. For building a
-    season: the per-pixel cloud mask, not the scene's cloud cover, decides what each image is worth."""
-    import planetary_computer
+    cover it on the same day, the clearer is kept), with band links (signed when read) and reflectance offset. For
+    building a season: the per-pixel cloud mask, not the scene's cloud cover, decides what each image is worth."""
     from pystac_client import Client
 
     catalog = Client.open(STAC_API_URL)
@@ -180,13 +186,9 @@ def covering_scenes(geojson_geometry: dict, start_date: str, end_date: str, max_
         if cur is None or (cc if cc is not None else 101) < (cur["cloud_cover"] if cur["cloud_cover"] is not None else 101):
             by_day[day] = {"item": item, "date": day, "cloud_cover": cc}
     chosen = [by_day[d] for d in sorted(by_day)][-max(1, int(limit)):]
-    out = []
-    for c in chosen:
-        signed = planetary_computer.sign(c["item"])
-        out.append({"scene_id": signed.id, "date": c["date"], "cloud_cover": c["cloud_cover"],
-                    "hrefs": {role: signed.assets[key].href for role, key in ASSET_MAP.items() if key in signed.assets},
-                    "offset": _reflectance_offset(signed)})
-    return out
+    return [{"scene_id": c["item"].id, "date": c["date"], "cloud_cover": c["cloud_cover"],
+             "hrefs": {role: c["item"].assets[key].href for role, key in ASSET_MAP.items() if key in c["item"].assets},
+             "offset": _reflectance_offset(c["item"])} for c in chosen]
 
 
 def search_scenes(geojson_geometry: dict, start_date: str, end_date: str,
@@ -198,7 +200,7 @@ def search_scenes(geojson_geometry: dict, start_date: str, end_date: str,
 def _read_on_grid(href: str, crs, transform, width: int, height: int,
                   resampling: Resampling) -> np.ndarray:
     """Read band 1 of `href` resampled onto the reference grid."""
-    with rasterio.open(href) as src:
+    with rasterio.open(signed(href)) as src:
         with WarpedVRT(src, crs=crs, transform=transform, width=width, height=height,
                        resampling=resampling, nodata=0) as vrt:
             return vrt.read(1)
@@ -234,7 +236,7 @@ def fetch_and_clip_bands(scene_href_map: dict, boundary_geojson: dict,
             raise ValueError("Scene has no 10 m band to use as the reference grid")
 
     # reference band: clip to the polygon, which defines the output grid
-    with rasterio.open(scene_href_map[ref_role]) as src:
+    with rasterio.open(signed(scene_href_map[ref_role])) as src:
         geom_in_raster_crs = transform_geom("EPSG:4326", src.crs, boundary_geojson)
         clipped, transform = rio_mask(src, [geom_in_raster_crs], crop=True, nodata=0)
         ref_dn = clipped[0]

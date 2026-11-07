@@ -151,7 +151,11 @@ The service is `backend/` (Railpack, `uvicorn main:app`), which also serves the 
 In Geohub: add `{"id": "farm", "redirect_uris": ["<APP_URL>/api/auth/callback"], "secret": "<ID_SECRET>"}` to
 `ID_CLIENTS`, and `farm=<APP_URL>` to `PRODUCT_URLS` (the app switcher).
 
-**Soil data:** upload `HWSD2.bil`, `HWSD2.hdr`, `HWSD2.prj` and `hwsd2.sqlite` once to the bucket under
+**Check the setup:** open `/api/setup` on the deployed FarmScan: it lists sign-in, email, fires, Land Registry and
+soil, and whether each is set up (no secrets shown).
+
+**Soil data:** without HWSD, crop suitability uses ISRIC SoilGrids (250 m, online, no key). For HWSD's extra layers
+(drainage, salinity, base saturation), upload `HWSD2.bil`, `HWSD2.hdr`, `HWSD2.prj` and `hwsd2.sqlite` once to the bucket under
 `farm/data/hwsd/` (build the sqlite with `backend/scripts/build_hwsd_sqlite.py`). FarmScan fetches them at start-up.
 
 ### Running it locally

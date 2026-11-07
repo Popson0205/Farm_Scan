@@ -103,7 +103,7 @@ def test_search_returns_best_ten_covering_scenes_not_everything(monkeypatch):
     assert all(s["coverage_pct"] >= 99 for s in out["scenes"])
     clouds = [s["cloud_cover"] for s in out["scenes"]]
     assert clouds == sorted(clouds)
-    assert seen["signed"] == 10                                      # only the winners are signed
+    assert seen["signed"] == 0                                       # links are signed when read, not when found
     kw = seen["search_kwargs"]
     assert kw["max_items"] == stac_client.CANDIDATE_POOL             # the real cap: limit= is just page size
     assert kw["query"] == {"eo:cloud_cover": {"lt": 30.0}}
