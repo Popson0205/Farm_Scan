@@ -4,7 +4,7 @@ Weekly farm alerts: what needs a look on each farm this week, from data that com
   dry spell    in the rainy season, 10+ days in a row without useful rain (≥ 1 mm) up to today and little forecast
   heavy rain   a day of ≥ 50 mm forecast in the next week (waterlogging, erosion, washing off inputs)
   heat         a day of ≥ 38 °C forecast (heat stress, worst at flowering)
-  fire         a satellite fire detection (NASA FIRMS, VIIRS 375 m) on the farm or within 500 m in the last 7 days
+  fire         a satellite fire detection (NASA FIRMS, VIIRS 375 m on NOAA-20 and NOAA-21) on the farm or within 500 m in the last 7 days
   crop drop    the farm's NDVI or radar index fell in an image of the last 21 days (from its timeline)
 
 Weather is modelled for the area (Open-Meteo, ~9–25 km), not measured on the farm; fire detections can be a cooking
@@ -22,6 +22,9 @@ DRY_AHEAD_MM = 5.0
 HEAVY_RAIN_MM = 50.0
 HEAT_C = 38.0
 FIRE_BUFFER_M = 500
+# VIIRS 375 m near-real-time fire detections. Suomi NPP stopped delivering new data on 2 Nov 2026, so NOAA-20 and
+# NOAA-21 are used (same instrument, same resolution, both flying).
+FIRMS_SOURCES = ("VIIRS_NOAA20_NRT", "VIIRS_NOAA21_NRT")
 FIRE_DAYS = 7
 CROP_DAYS = 21
 
@@ -110,12 +113,19 @@ def fetch_fires(geometry: dict, days: int = FIRE_DAYS) -> list[dict] | None:
     import requests
     from shapely.geometry import shape
     w, s, e, n = shape(geometry).buffer(0.01).bounds
-    out = []
-    for source in ("VIIRS_SNPP_NRT", "VIIRS_NOAA20_NRT"):
+    out, failed = [], 0
+    for source in FIRMS_SOURCES:
         url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/{source}/{w:.4f},{s:.4f},{e:.4f},{n:.4f}/{min(10, days)}"
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-        out += list(csv.DictReader(io.StringIO(r.text)))
+        try:
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            if not r.text.lower().startswith("latitude"):            # FIRMS answers errors as plain text with 200
+                raise ValueError(r.text[:200])
+            out += list(csv.DictReader(io.StringIO(r.text)))
+        except Exception:
+            failed += 1
+    if failed == len(FIRMS_SOURCES):
+        raise RuntimeError("NASA FIRMS could not be reached (or refused the MAP_KEY)")
     return out
 
 

@@ -143,3 +143,27 @@ def test_brevo_is_used_like_geohub(monkeypatch):
     assert url == "https://api.brevo.com/v3/smtp/email" and headers["api-key"] == "xkeysib-test"
     assert body["sender"] == {"name": "GeoEstate", "email": "no-reply@geoestate.ng"} and body["to"] == [{"email": "ada@example.com"}]
     assert body["replyTo"] == {"email": "support@geoestate.ng"} and body["textContent"] == "Dry spell"
+
+
+def test_fires_come_from_noaa20_and_noaa21(monkeypatch):
+    """Suomi NPP stopped on 2 Nov 2026: fires are read from NOAA-20 and NOAA-21; one failing source does not stop the other."""
+    monkeypatch.setenv("FIRMS_MAP_KEY", "k")
+    asked = []
+
+    class R:
+        def __init__(self, text): self.text = text
+        def raise_for_status(self): pass
+
+    def get(url, timeout):
+        asked.append(url)
+        if "NOAA21" in url:
+            return R("Invalid MAP_KEY.")
+        return R("latitude,longitude,acq_date\n9.072,7.402,2026-11-05\n")
+    import requests
+    monkeypatch.setattr(requests, "get", get)
+    got = alerts.fetch_fires(POLY)
+    assert len(got) == 1 and any("VIIRS_NOAA20_NRT" in u for u in asked) and any("VIIRS_NOAA21_NRT" in u for u in asked)
+    assert not any("SNPP" in u for u in asked)
+    monkeypatch.setattr(requests, "get", lambda url, timeout: R("Invalid MAP_KEY."))
+    with pytest.raises(RuntimeError):
+        alerts.fetch_fires(POLY)
