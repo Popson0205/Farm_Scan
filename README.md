@@ -119,8 +119,9 @@ FarmScan is one of the GeoEstate products. It has no accounts of its own:
 
 - **Weekly alerts** (`GET /api/alerts`, plan feature `alerts`): for every farm, a dry spell in the rainy season (10+
   days without ≥ 1 mm and little forecast), heavy rain (≥ 50 mm) or heat (≥ 38 °C) in the next week (Open-Meteo),
-  satellite fire detections on or within 500 m of the farm in the last 7 days (NASA FIRMS, needs `FIRMS_MAP_KEY`, free
-  at firms.modaps.eosdis.nasa.gov/api/map_key), and crop drops in the farm's timeline in the last 21 days. People who
+  satellite fire detections on or within 500 m of the farm in the last 7 days (NASA FIRMS VIIRS on NOAA-20 and NOAA-21 —
+  Suomi NPP stopped on 2 Nov 2026 — needs `FIRMS_MAP_KEY`, free from the "Get MAP Key" button at
+  https://firms.modaps.eosdis.nasa.gov/api/area/), and crop drops in the farm's timeline in the last 21 days. People who
   ask for them get them by email once a week (an hourly check in the service; one email per organization per week,
   only while its licence includes alerts and is current). Email goes through `BREVO_API_KEY` (or `RESEND_API_KEY`, `SMTP_*`), from
   `MAIL_FROM` — the same as Geohub's.
