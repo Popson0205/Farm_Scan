@@ -78,7 +78,7 @@ def _uuid(v: str, what: str = "Farm") -> str:
 def _farm(user: dict, boundary_id: str, conn=None) -> dict:
     """The farm, if it belongs to the person's organization (404 otherwise, as if it did not exist)."""
     bid = _uuid(boundary_id)
-    sql = ("SELECT id::text AS id, name, geojson, area_ha, created_by, created_at::text AS created_at FROM boundaries "
+    sql = ("SELECT id::text AS id, name, geojson, area_ha, created_by, created_at::text AS created_at, details, source FROM boundaries "
            "WHERE id = %s AND org_id = %s")
     if conn is not None:
         row = conn.execute(sql, (bid, user["org_id"])).fetchone()
@@ -220,13 +220,14 @@ def create_boundary(name: str = Form(...), geojson: str = Form(...), user=Depend
 def get_boundary(boundary_id: str, user=Depends(reader)):
     row = _farm(user, boundary_id)
     return {"boundary_id": row["id"], "name": row["name"], "geojson": row["geojson"], "area_ha": row["area_ha"],
-            "created_by": row["created_by"], "created_at": row["created_at"]}
+            "created_by": row["created_by"], "created_at": row["created_at"], "details": row["details"], "source": row["source"]}
 
 
 @app.get("/api/boundaries")
 def list_boundaries(user=Depends(reader)):
     with db.tx() as conn:
-        return conn.execute("SELECT id::text AS id, name, area_ha, created_by, created_at::text AS created_at FROM boundaries "
+        return conn.execute("SELECT id::text AS id, name, area_ha, created_by, created_at::text AS created_at, source, "
+                            "details->>'farmer_name' AS farmer FROM boundaries "
                             "WHERE org_id = %s ORDER BY created_at DESC", (user["org_id"],)).fetchall()
 
 
@@ -1090,6 +1091,281 @@ def health():
     with db.tx() as conn:
         conn.execute("SELECT 1")
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Many farms: the organization's portfolio, farms from Geohub, scouting tasks to Geohub
+# ---------------------------------------------------------------------------
+
+def _geohub_token(request: Request) -> str:
+    token = getattr(request.state, "at", None) or request.cookies.get(identity.AT)
+    if not token:
+        raise Problem(401, "Sign in again to reach Geohub.", code="unauthenticated")
+    return token
+
+
+def _geohub(request: Request, path: str, params: dict | None = None):
+    """Geohub's field data, read as the person (only what they could open in Geohub)."""
+    try:
+        return identity.client().data(_geohub_token(request), path, params)
+    except GeoEstateIDError as e:
+        if e.status in (401, 403, 404):
+            raise Problem(e.status if e.status != 401 else 403, str(e), code=e.code or "geohub")
+        raise Problem(502, f"Geohub could not be reached ({e}). Try again in a minute.", code="geohub_unreachable")
+
+
+def _geohub_forms(request: Request, template: str) -> list[dict]:
+    out = []
+    for p in _geohub(request, "projects"):
+        for f in p.get("forms", []):
+            if f.get("template") == template:
+                out.append({"form_id": str(f["id"]), "name": f["name"], "project_id": str(p["id"]), "project_name": p["name"],
+                            "features": f.get("features", 0)})
+    return out
+
+
+def _all_features(request: Request, form_id: str) -> list[dict]:
+    rows, after = [], 0
+    while True:
+        page = _geohub(request, f"forms/{form_id}/features", {"after": after, "limit": 1000})
+        rows += page["features"]
+        if not page.get("next"):
+            return rows
+        after = page["next"]
+
+
+@app.get("/api/portfolio", summary="Every farm of the organization with its latest health, alerts and open scouting tasks")
+def portfolio(index: str = "ndvi", user=Depends(reader)):
+    """Ranked weakest first: farms whose latest image shows a drop (alert) first, then by the latest mean value. Farms
+    with no usable image yet come last. Sample data counts only where DEMO_TOOLS is on."""
+    if index not in INDEX_REGISTRY:
+        raise HTTPException(400, f"Unknown index '{index}'")
+    with db.tx() as conn:
+        farms = conn.execute(
+            "SELECT b.id::text AS id, b.name, b.area_ha, b.details, b.source, ST_Y(ST_Centroid(b.geom)) AS lat, "
+            "  ST_X(ST_Centroid(b.geom)) AS lng, ST_AsGeoJSON(ST_SimplifyPreserveTopology(b.geom, 0.00002), 6)::jsonb AS geometry, "
+            "  (SELECT count(*) FROM scouting_tasks t WHERE t.boundary_id = b.id AND t.status = 'open') AS open_tasks "
+            "FROM boundaries b WHERE b.org_id = %s ORDER BY b.created_at", (user["org_id"],)).fetchall()
+        obs = conn.execute(
+            "SELECT o.boundary_id::text AS boundary_id, o.index_name, o.obs_date, o.source, o.scene_id, o.cloud_cover, "
+            "  o.valid_fraction, o.mean, o.median, o.std, o.p10, o.p90, o.pixel_count FROM observations o "
+            "JOIN boundaries b ON b.id = o.boundary_id WHERE b.org_id = %s AND o.index_name = %s"
+            + ("" if settings.demo_tools else " AND o.source <> 'demo'") + " ORDER BY o.obs_date",
+            (user["org_id"], index)).fetchall()
+    by_farm: dict[str, list] = {}
+    for o in obs:
+        by_farm.setdefault(o["boundary_id"], []).append(o)
+    out = []
+    for f in farms:
+        t = monitoring_mod.analyze_trend(by_farm.get(f["id"], []))
+        usable = [s for s in t["series"] if s["usable"]]
+        last = usable[-1] if usable else None
+        d = f["details"] or {}
+        out.append({
+            "id": f["id"], "name": f["name"], "area_ha": f["area_ha"], "source": f["source"], "lat": f["lat"], "lng": f["lng"],
+            "geometry": f["geometry"], "farmer": d.get("farmer_name"), "community": d.get("community"), "crops": d.get("crops") or [],
+            "latest": last and {"obs_date": last["obs_date"], "mean": round(last["mean"], 3), "source": last["source"],
+                                "change_vs_prev": None if last["change_vs_prev"] is None else round(last["change_vs_prev"], 3)},
+            "images": len(usable), "status": t["status"], "alert": bool(last and last.get("alert")),
+            "alerts": len(t["alerts"]), "open_tasks": f["open_tasks"],
+        })
+    out.sort(key=lambda r: (r["latest"] is None, not r["alert"], r["latest"]["mean"] if r["latest"] else 0))
+    for i, r in enumerate(out, 1):
+        r["rank"] = i
+    return {"index": index, "farms": out, "farm_count": len(out), "hectares": round(sum(r["area_ha"] for r in out), 2),
+            "with_alerts": sum(1 for r in out if r["alert"]), "without_images": sum(1 for r in out if not r["latest"])}
+
+
+@app.get("/api/geohub/forms", summary="The person's Geohub forms made from a FarmScan template")
+def geohub_forms(request: Request, template: str, user=Depends(reader)):
+    if template not in ("farm_enumeration", "farm_scouting"):
+        raise HTTPException(400, "template is farm_enumeration or farm_scouting")
+    return _geohub_forms(request, template)
+
+
+FARMER_KEYS = ("farmer_name", "farmer_phone", "farmer_gender", "farmer_group", "community", "lga", "state", "crops",
+               "planting_date", "declared_ha", "tenure", "water", "farm_name", "remarks")
+
+
+@app.post("/api/enumeration/import", summary="Bring in the farms a field team mapped with a Geohub \"Farm enumeration\" form")
+def import_enumerated_farms(request: Request, form_id: str = Form(...), user=Depends(writer)):
+    """Each submitted or approved record with an area becomes a farm, with its farmer's details (records already
+    brought in are skipped, so it can be run again as more come in). Drafts and records a reviewer sent back are left
+    out. The plan's hectares apply: farms that would go over are reported, not added."""
+    form_id = _uuid(form_id, "Form")
+    form = next((f for f in _geohub_forms(request, "farm_enumeration") if f["form_id"] == form_id), None)
+    if not form:
+        raise Problem(404, "That Geohub form is not a Farm enumeration form you can open.", code="not_found")
+    feats = _all_features(request, form_id)
+    added, skipped, problems = [], 0, []
+    limit = (user["limits"] or {}).get("hectares")
+    with db.tx() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (user["org_id"],))
+        used = conn.execute("SELECT coalesce(sum(area_ha), 0) AS ha FROM boundaries WHERE org_id = %s", (user["org_id"],)).fetchone()["ha"]
+        have = {r["source_feature"] for r in conn.execute(
+            "SELECT source_feature::text AS source_feature FROM boundaries WHERE org_id = %s AND source_feature IS NOT NULL",
+            (user["org_id"],)).fetchall()}
+        for ft in feats:
+            fid = str(ft["id"])
+            if ft.get("status") not in ("submitted", "approved"):
+                continue
+            if fid in have:
+                skipped += 1
+                continue
+            p = ft.get("properties") or {}
+            label = p.get("farm_name") or (f"{p['farmer_name']}'s farm" if p.get("farmer_name") else f"Farm {ft.get('seq')}")
+            g = ft.get("geometry") or {}
+            if g.get("type") not in ("Polygon", "MultiPolygon"):
+                problems.append({"record": ft.get("seq"), "farm": label, "problem": "has no area (not a walked boundary)"})
+                continue
+            try:
+                geom = _valid_shape(g)
+            except HTTPException:
+                problems.append({"record": ft.get("seq"), "farm": label, "problem": "its boundary crosses itself; fix it in Geohub"})
+                continue
+            area_ha = round(geo.area_m2(geom) / 10000, 2)
+            if limit is not None and used + area_ha > limit:
+                problems.append({"record": ft.get("seq"), "farm": label,
+                                 "problem": f"{area_ha:,.2f} ha would go over the plan's {limit:,} ha"})
+                continue
+            details = {k: p[k] for k in FARMER_KEYS if p.get(k) not in (None, "", [])}
+            details |= {"collected_by": ft.get("created_by_name"), "geohub_record": ft.get("seq"), "geohub_form": form["name"]}
+            if community := p.get("community"):
+                label = f"{label}, {community}" if community not in label else label
+            bid = str(uuid.uuid4())
+            conn.execute("INSERT INTO boundaries (id, org_id, name, geojson, area_ha, created_by, details, source, source_feature, "
+                         "source_form) VALUES (%s, %s, %s, %s, %s, %s, %s, 'geohub', %s, %s)",
+                         (bid, user["org_id"], label[:200], Jsonb(g), area_ha, user["name"], Jsonb(details), fid, form_id))
+            used += area_ha
+            added.append({"boundary_id": bid, "name": label, "area_ha": area_ha})
+    return {"form": form["name"], "added": added, "already_here": skipped, "problems": problems,
+            "hectares_used": round(used, 2), "hectares_limit": limit}
+
+
+@app.get("/api/settings")
+def get_settings(user=Depends(reader)):
+    with db.tx() as conn:
+        row = conn.execute("SELECT scouting_form::text AS scouting_form, scouting_project::text AS scouting_project, "
+                           "scouting_form_name, updated_by, updated_at::text AS updated_at FROM org_settings WHERE org_id = %s",
+                           (user["org_id"],)).fetchone()
+    return row or {"scouting_form": None, "scouting_project": None, "scouting_form_name": None}
+
+
+@app.put("/api/settings/scouting", summary="The Geohub form (made from the Farm scouting template) scouts answer in")
+def set_scouting_form(request: Request, form_id: str = Form(...), user=Depends(need("manager", write=True, feature="monitoring"))):
+    form_id = _uuid(form_id, "Form")
+    form = next((f for f in _geohub_forms(request, "farm_scouting") if f["form_id"] == form_id), None)
+    if not form:
+        raise Problem(404, "That Geohub form is not a Farm scouting form you can open.", code="not_found")
+    with db.tx() as conn:
+        conn.execute("INSERT INTO org_settings (org_id, scouting_form, scouting_project, scouting_form_name, updated_by) "
+                     "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (org_id) DO UPDATE SET scouting_form = EXCLUDED.scouting_form, "
+                     "scouting_project = EXCLUDED.scouting_project, scouting_form_name = EXCLUDED.scouting_form_name, "
+                     "updated_by = EXCLUDED.updated_by, updated_at = now()",
+                     (user["org_id"], form_id, form["project_id"], f"{form['name']} ({form['project_name']})", user["name"]))
+    return get_settings(user)
+
+
+def _task_link(project: str, form: str, farm: str, ref: str, seen: str, lat: float, lng: float) -> str:
+    fill = base64.urlsafe_b64encode(json.dumps({"farm": farm, "task_ref": ref, "seen": seen}, ensure_ascii=False)
+                                    .encode()).decode().rstrip("=")
+    return f"{settings.geohub_url}/collect/{project}?form={form}&fill={fill}&at={lat:.6f},{lng:.6f}"
+
+
+TASK_SQL = ("SELECT id::text AS id, ref, rank, lat, lng, area_m2, index_name, obs_date, seen, status, link, findings, "
+            "found_at::text AS found_at, created_by, created_at::text AS created_at FROM scouting_tasks ")
+
+
+@app.post("/api/scouting/tasks", summary="Send the farm's problem areas to scouts: one Geohub link per area")
+def send_to_scouts(boundary_id: str = Form(...), index: str = Form("ndvi"), sensitivity: float = Form(1.5),
+                   min_area_m2: float = Form(400.0), user=Depends(need("agronomist", write=True, feature="monitoring"))):
+    """Finds the problem areas in the last processed image (as Find problem areas does) and makes a scouting task for
+    each, replacing this farm's tasks still open. Each task has a link that opens the organization's Geohub scouting
+    form with the farm, the task and what the satellite saw filled in, and the place marked; send the links to scouts
+    (WhatsApp, SMS). Their answers come back with "Check scouts' answers"."""
+    farm = _farm(user, boundary_id)
+    with db.tx() as conn:
+        st = conn.execute("SELECT scouting_form::text AS f, scouting_project::text AS p FROM org_settings WHERE org_id = %s",
+                          (user["org_id"],)).fetchone()
+    if not st or not st["f"]:
+        raise Problem(409, "Choose your organization's Geohub scouting form first (a form made from the Farm scouting "
+                           "template). A manager sets it once.", code="no_scouting_form")
+    cached = _cached(farm["id"], index)
+    try:
+        result = monitoring_mod.find_problem_areas(cached["array"], cached["transform"], cached["crs"], index,
+                                                   sensitivity=sensitivity, min_area_m2=min_area_m2)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    obs_date = cached.get("obs_date") or ""
+    tasks = []
+    with db.tx() as conn:
+        conn.execute("UPDATE scouting_tasks SET status = 'cancelled' WHERE boundary_id = %s AND status = 'open'", (farm["id"],))
+        for a in result["areas"]:
+            tid = uuid.uuid4()
+            ref = f"FS-{tid.hex[:6].upper()}"
+            seen = monitoring_mod.scouting_note_text(a, index, obs_date)
+            lat, lng = a["centroid"]["lat"], a["centroid"]["lng"]
+            link = _task_link(st["p"], st["f"], farm["name"], ref, seen, lat, lng)
+            conn.execute("INSERT INTO scouting_tasks (id, boundary_id, ref, rank, lat, lng, area_m2, index_name, obs_date, seen, link, "
+                         "created_by) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                         (str(tid), farm["id"], ref, a["rank"], lat, lng, a.get("area_m2"), index, obs_date, seen, link,
+                          user["name"]))
+        tasks = conn.execute(TASK_SQL + "WHERE boundary_id = %s AND status = 'open' ORDER BY rank", (farm["id"],)).fetchall()
+    return {"farm": farm["name"], "obs_date": obs_date, "tasks": tasks, "summary": result["summary"],
+            "message": _whatsapp_text(farm["name"], tasks)}
+
+
+def _whatsapp_text(farm: str, tasks: list[dict]) -> str:
+    lines = [f"Scouting for {farm}: {len(tasks)} place{'s' if len(tasks) != 1 else ''} to check. Open each link on your phone, "
+             "go to the marked place and record what you find."]
+    lines += [f"{t['rank']}. {t['ref']}: {t['link']}" for t in tasks]
+    return "\n".join(lines)
+
+
+@app.get("/api/scouting/tasks", summary="A farm's scouting tasks and what the scouts found")
+def scouting_tasks(boundary_id: str, include_closed: bool = True, user=Depends(reader)):
+    farm = _farm(user, boundary_id)
+    with db.tx() as conn:
+        rows = conn.execute(TASK_SQL + "WHERE boundary_id = %s AND status <> 'cancelled'" + ("" if include_closed else " AND status = 'open'")
+                            + " ORDER BY status = 'open' DESC, rank", (farm["id"],)).fetchall()
+    open_ = [r for r in rows if r["status"] == "open"]
+    return {"farm": farm["name"], "tasks": rows, "open": len(open_), "message": _whatsapp_text(farm["name"], open_) if open_ else None}
+
+
+@app.post("/api/scouting/refresh", summary="Read the scouts' answers back from Geohub")
+def scouting_refresh(request: Request, user=Depends(need(feature="monitoring"))):
+    """Matches the records in the organization's Geohub scouting form to the tasks by their task reference. A record
+    a reviewer sent back, or a draft, is not taken."""
+    with db.tx() as conn:
+        st = conn.execute("SELECT scouting_form::text AS f FROM org_settings WHERE org_id = %s", (user["org_id"],)).fetchone()
+    if not st or not st["f"]:
+        raise Problem(409, "No Geohub scouting form is chosen yet.", code="no_scouting_form")
+    feats = [f for f in _all_features(request, st["f"]) if f.get("status") in ("submitted", "approved")]
+    by_ref = {}
+    for f in feats:
+        ref = (f.get("properties") or {}).get("task_ref")
+        if ref:
+            by_ref[str(ref).strip()] = f                       # the latest record for a task wins (oldest first)
+    updated = 0
+    with db.tx() as conn:
+        tasks = conn.execute("SELECT t.id::text AS id, t.ref, t.findings FROM scouting_tasks t JOIN boundaries b ON b.id = t.boundary_id "
+                             "WHERE b.org_id = %s AND t.status <> 'cancelled' AND t.ref = ANY(%s)",
+                             (user["org_id"], list(by_ref))).fetchall()
+        for t in tasks:
+            f = by_ref[t["ref"]]
+            p = f.get("properties") or {}
+            photos = p.get("photos") or []
+            findings = {"visited": p.get("visited"), "causes": p.get("causes") or [], "severity": p.get("severity"),
+                        "affected_pct": p.get("affected_pct"), "notes": p.get("notes"), "photos": len(photos) if isinstance(photos, list) else 0,
+                        "scout": f.get("created_by_name"), "recorded_at": f.get("updated_at") or f.get("created_at"),
+                        "reviewed": f.get("status") == "approved",
+                        "at": (f.get("geometry") or {}).get("coordinates")}
+            status = "unreachable" if p.get("visited") == "Could not reach it" else "found"
+            if findings != t["findings"]:
+                conn.execute("UPDATE scouting_tasks SET findings = %s, status = %s, geohub_feature = %s, found_at = now() WHERE id = %s",
+                             (Jsonb(findings), status, str(f["id"]), t["id"]))
+                updated += 1
+    return {"records_read": len(feats), "tasks_updated": updated}
 
 
 app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")

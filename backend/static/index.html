@@ -64,6 +64,15 @@
   #signin .err { color: var(--danger); font-size: 13px; }
   .section.locked > *:not(h2):not(.plan-note) { opacity: .45; pointer-events: none; }
   .plan-note { font-size: 12px; color: #6b4e00; background: #fff4d6; border-radius: 7px; padding: 7px 10px; margin: 0 0 10px; }
+  .health-dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+  .pf-row { display:grid; grid-template-columns: 28px 1fr auto; gap:6px; align-items:center; padding:8px 10px; border:1px solid var(--border);
+    border-radius:8px; margin-bottom:6px; cursor:pointer; font-size:12.5px; background:#fff; }
+  .pf-row:hover { border-color: var(--green-400); }
+  .pf-row .meta { color: var(--muted); font-size: 11.5px; }
+  .pf-row .alert { color: var(--danger); font-weight: 600; }
+  .task-row { border:1px solid var(--border); border-radius:8px; padding:8px 10px; margin-bottom:6px; font-size:12.5px; }
+  .task-row .ref { font-weight:700; }
+  .task-row.found { border-color:#9fd3b0; background:#f1faf4; } .task-row.unreachable { border-color:#f0dca0; background:#fffaf0; }
   .sample-note { font-size: 12px; color: #8a2b16; background: #fde7e2; border-radius: 7px; padding: 7px 10px; margin: 8px 0 0; }
 
   #body { flex: 1; display: flex; min-height: 0; }
@@ -203,6 +212,17 @@
         <button class="btn btn-secondary" id="btn-upload">📁 Upload GeoJSON</button>
       </div>
       <input type="file" id="file-input" accept=".json,.geojson" style="display:none;">
+      <div class="btn-row" style="margin-bottom:10px;">
+        <button class="btn btn-secondary" id="btn-portfolio">🗺 All farms</button>
+        <button class="btn btn-secondary" id="btn-import-geohub">⬇ From Geohub</button>
+      </div>
+      <div id="geohub-import" style="display:none; margin-bottom:10px;">
+        <label for="geohub-enum-form">Geohub "Farm enumeration" form</label>
+        <select id="geohub-enum-form"></select>
+        <button class="btn btn-primary" id="btn-run-import">Bring in its farms</button>
+        <div class="hint">Every submitted or approved record with a walked boundary becomes a farm with its farmer's details. Run it again as more come in: farms already here are skipped.</div>
+      </div>
+      <div id="farm-details" class="hint" style="display:none; margin:0 0 8px;"></div>
       <div id="farm-list"></div>
       <div class="status-msg" id="boundary-status"></div>
     </div>
@@ -279,6 +299,12 @@
         </label>
         <button class="btn btn-primary" id="btn-problem-areas">🔎 Find problem areas</button>
         <div id="problem-box" style="display:none; margin-top:10px;"></div>
+        <div style="margin-top:12px;">
+          <button class="btn btn-secondary" id="btn-send-scouts">📲 Send problem areas to scouts (Geohub)</button>
+          <button class="btn btn-secondary" id="btn-scout-answers" style="margin-top:8px;">✅ Check scouts' answers</button>
+          <div id="scouting-setup" class="hint" style="display:none;"></div>
+          <div id="scout-box" style="display:none; margin-top:10px;"></div>
+        </div>
       </div>
       <div class="status-msg" id="monitor-status"></div>
     </div>
@@ -1557,6 +1583,162 @@ function applyPlan() {
   applyPlan();
   await loadFarms();
 })();
+
+// =====================================================================
+// Many farms: farms from Geohub, the portfolio, scouting tasks to Geohub
+// =====================================================================
+const NDVI_COLOR = v => v == null ? '#9aa5a0' : v < 0.2 ? '#b3462c' : v < 0.35 ? '#e08a2c' : v < 0.5 ? '#d6c23a' : v < 0.65 ? '#6a9f3a' : '#2c7a45';
+let portfolioLayer = null;
+
+async function showFarmDetails(f) {
+  const box = document.getElementById('farm-details');
+  const d = f.details || {};
+  const bits = [d.farmer_name && `Farmer: <b>${esc(d.farmer_name)}</b>${d.farmer_phone ? ` (${esc(d.farmer_phone)})` : ''}`,
+    d.crops && d.crops.length && `Crops: ${esc(d.crops.join(', '))}`, d.planting_date && `Planted ${esc(d.planting_date)}`,
+    d.community && `${esc([d.community, d.lga, d.state].filter(Boolean).join(', '))}`,
+    d.declared_ha && `Farmer gives ${esc(d.declared_ha)} ha (measured ${esc(f.area_ha)} ha)`,
+    f.source === 'geohub' && d.collected_by && `Mapped in Geohub by ${esc(d.collected_by)}`].filter(Boolean);
+  box.innerHTML = bits.join(' · ');
+  box.style.display = bits.length ? 'block' : 'none';
+}
+const _openFarm = openFarm;
+openFarm = async function (id) {
+  if (portfolioLayer) { map.removeLayer(portfolioLayer); portfolioLayer = null; }
+  await _openFarm(id);
+  const res = await fetch(`${API_BASE}/boundary/${id}`);
+  if (res.ok) showFarmDetails(await res.json());
+  document.getElementById('scout-box').style.display = 'none';
+};
+
+document.getElementById('btn-import-geohub').onclick = async () => {
+  const box = document.getElementById('geohub-import');
+  if (box.style.display === 'block') { box.style.display = 'none'; return; }
+  box.style.display = 'block';
+  const sel = document.getElementById('geohub-enum-form');
+  sel.innerHTML = '<option>Loading your Geohub forms…</option>';
+  const res = await fetch(`${API_BASE}/geohub/forms?template=farm_enumeration`);
+  const forms = res.ok ? await res.json() : [];
+  sel.innerHTML = forms.length ? forms.map(f => `<option value="${esc(f.form_id)}">${esc(f.name)} — ${esc(f.project_name)} (${f.features} records)</option>`).join('')
+    : '<option value="">No Farm enumeration form yet: in Geohub, add a form and start from "Farm enumeration"</option>';
+  if (!res.ok) showStatus('boundary-status', (await res.json().catch(() => ({}))).detail || 'Geohub could not be reached.', 'error');
+};
+document.getElementById('btn-run-import').onclick = async () => {
+  const id = document.getElementById('geohub-enum-form').value;
+  if (!id) return;
+  showStatus('boundary-status', 'Bringing in farms from Geohub…', 'info');
+  const form = new FormData(); form.append('form_id', id);
+  const res = await fetch(`${API_BASE}/enumeration/import`, { method: 'POST', body: form });
+  const r = await res.json();
+  if (!res.ok) { showStatus('boundary-status', r.detail || 'Could not bring them in.', 'error'); return; }
+  const probs = r.problems.length ? ` ${r.problems.length} not added: ` + r.problems.slice(0, 4).map(p => `#${p.record} ${p.farm} (${p.problem})`).join('; ') + (r.problems.length > 4 ? '…' : '') : '';
+  showStatus('boundary-status', `${r.added.length} farm(s) added, ${r.already_here} already here.${probs}`, r.problems.length ? 'info' : 'success');
+  if (ME) { ME.hectares_used = r.hectares_used; renderAccount(); }
+  await loadFarms();
+};
+
+document.getElementById('btn-portfolio').onclick = async () => {
+  showStatus('boundary-status', 'Loading all farms…', 'info');
+  const res = await fetch(`${API_BASE}/portfolio?index=ndvi`);
+  if (!res.ok) { showStatus('boundary-status', (await res.json()).detail || 'Could not load the farms.', 'error'); return; }
+  const p = await res.json();
+  if (!p.farms.length) { showStatus('boundary-status', 'No farms yet.', 'info'); return; }
+  currentBoundaryId = null; drawnItems.clearLayers();
+  if (overlayLayer) { map.removeLayer(overlayLayer); overlayLayer = null; }
+  if (portfolioLayer) map.removeLayer(portfolioLayer);
+  portfolioLayer = L.geoJSON(p.farms.map(f => ({ type: 'Feature', properties: f, geometry: f.geometry })), {
+    style: ft => ({ color: '#ffffff', weight: 1.5, fillColor: NDVI_COLOR(ft.properties.latest && ft.properties.latest.mean), fillOpacity: 0.7 }),
+  }).addTo(map);
+  portfolioLayer.eachLayer(l => {
+    const f = l.feature.properties;
+    l.bindTooltip(`${esc(f.name)}: ${f.latest ? `NDVI ${f.latest.mean} (${esc(f.latest.obs_date)})` : 'no image yet'}${f.alert ? ' · dropping' : ''}`);
+    l.on('click', () => openFarm(f.id));
+  });
+  map.fitBounds(portfolioLayer.getBounds().pad(0.1));
+  const rows = p.farms.map(f => `<div class="pf-row" data-id="${esc(f.id)}">
+      <span>#${f.rank}</span>
+      <span><span class="health-dot" style="background:${NDVI_COLOR(f.latest && f.latest.mean)}"></span><b>${esc(f.name)}</b>
+        <div class="meta">${f.area_ha} ha${f.farmer ? ' · ' + esc(f.farmer) : ''}${f.crops.length ? ' · ' + esc(f.crops.join(', ')) : ''}</div></span>
+      <span style="text-align:right;">${f.latest ? `NDVI <b>${f.latest.mean}</b><div class="meta">${esc(f.latest.obs_date)}</div>` : '<span class="meta">no image yet</span>'}
+        ${f.alert ? '<div class="alert">dropping</div>' : ''}${f.open_tasks ? `<div class="meta">${f.open_tasks} to scout</div>` : ''}</span>
+    </div>`).join('');
+  const list = document.getElementById('farm-list');
+  list.innerHTML = `<div class="hint" style="margin:0 0 8px;"><b>${p.farm_count}</b> farms · ${p.hectares.toLocaleString()} ha · <b>${p.with_alerts}</b> dropping · ${p.without_images} without an image yet. Weakest first; click one to open it.</div>${rows}`;
+  list.querySelectorAll('.pf-row').forEach(el => el.onclick = () => openFarm(el.dataset.id));
+  document.getElementById('farm-details').style.display = 'none';
+  document.getElementById('boundary-status').className = 'status-msg';
+};
+
+async function scoutingSetup() {
+  const res = await fetch(`${API_BASE}/settings`);
+  const st = res.ok ? await res.json() : {};
+  const box = document.getElementById('scouting-setup');
+  if (st.scouting_form) { box.style.display = 'block'; box.innerHTML = `Scouts answer in Geohub: <b>${esc(st.scouting_form_name)}</b>.`; return st; }
+  box.style.display = 'block';
+  if (!ME || ME.role !== 'manager') { box.innerHTML = 'A manager of your organization chooses the Geohub scouting form once.'; return st; }
+  const fr = await fetch(`${API_BASE}/geohub/forms?template=farm_scouting`);
+  const forms = fr.ok ? await fr.json() : [];
+  box.innerHTML = forms.length
+    ? `Choose the Geohub form scouts answer in: <select id="scout-form-pick">${forms.map(f => `<option value="${esc(f.form_id)}">${esc(f.name)} — ${esc(f.project_name)}</option>`).join('')}</select>
+       <button class="btn btn-secondary" id="btn-scout-form-save" style="margin-top:6px;">Use this form</button>`
+    : 'First, in Geohub, add a form to the project your scouts use and start it from "Farm scouting"; publish it, then come back here.';
+  const save = document.getElementById('btn-scout-form-save');
+  if (save) save.onclick = async () => {
+    const form = new FormData(); form.append('form_id', document.getElementById('scout-form-pick').value);
+    const r = await fetch(`${API_BASE}/settings/scouting`, { method: 'PUT', body: form });
+    if (!r.ok) { showStatus('monitor-status', (await r.json()).detail, 'error'); return; }
+    await scoutingSetup();
+  };
+  return st;
+}
+
+function renderTasks(data, fresh) {
+  const box = document.getElementById('scout-box');
+  box.style.display = 'block';
+  if (!data.tasks.length) { box.innerHTML = '<div class="hint">No scouting tasks for this farm.</div>'; return; }
+  const words = { open: 'to visit', found: 'found', unreachable: 'could not reach' };
+  const rows = data.tasks.map(t => {
+    const f = t.findings || {};
+    const found = t.status === 'found' ? `<div><b>${esc((f.causes || []).join(', ') || 'Nothing recorded')}</b>${f.severity ? ' · ' + esc(f.severity) : ''}${f.affected_pct != null ? ` · ${esc(f.affected_pct)}% affected` : ''}${f.photos ? ` · ${f.photos} photo(s) in Geohub` : ''}</div>${f.notes ? `<div class="meta">${esc(f.notes)}</div>` : ''}<div class="meta">${esc(f.scout || '')}${f.reviewed ? ' · reviewed' : ''}</div>` : '';
+    return `<div class="task-row ${t.status}"><span class="ref">#${t.rank} ${esc(t.ref)}</span> · ${words[t.status] || esc(t.status)}
+      <div class="meta">${esc(t.seen)}</div>${found}
+      ${t.status === 'open' ? `<a href="${esc(t.link)}" target="_blank" rel="noopener">Open in Geohub</a>` : ''}</div>`;
+  }).join('');
+  const msg = data.message ? `<button class="btn btn-secondary" id="btn-copy-tasks" style="margin-bottom:6px;">Copy the links for WhatsApp</button>
+     <a class="btn btn-secondary" style="display:block; text-align:center; text-decoration:none; margin-bottom:8px;" target="_blank" rel="noopener"
+        href="https://wa.me/?text=${encodeURIComponent(data.message)}">Share on WhatsApp</a>` : '';
+  box.innerHTML = `${fresh ? `<div class="hint">${data.tasks.length} task(s) made; earlier open tasks for this farm were replaced.</div>` : ''}${msg}${rows}`;
+  const copy = document.getElementById('btn-copy-tasks');
+  if (copy) copy.onclick = async () => { try { await navigator.clipboard.writeText(data.message); copy.textContent = 'Copied'; } catch { prompt('Copy the links:', data.message); } };
+}
+
+document.getElementById('btn-send-scouts').onclick = async () => {
+  if (!currentBoundaryId) { showStatus('monitor-status', 'Open a farm first.', 'error'); return; }
+  if (lastProcessedBoundaryId !== currentBoundaryId || lastProcessedIndex !== selectedIndex) {
+    showStatus('monitor-status', `Run ${selectedIndex.toUpperCase()} for this farm first (steps 1–3, then ▶ Run).`, 'error'); return;
+  }
+  const st = await scoutingSetup();
+  if (!st.scouting_form) return;
+  showStatus('monitor-status', 'Making scouting tasks…', 'info');
+  const form = new FormData();
+  form.append('boundary_id', currentBoundaryId); form.append('index', selectedIndex);
+  form.append('sensitivity', document.getElementById('scout-sensitivity').value);
+  const res = await fetch(`${API_BASE}/scouting/tasks`, { method: 'POST', body: form });
+  const data = await res.json();
+  if (!res.ok) { showStatus('monitor-status', data.detail || 'Could not make the tasks.', 'error'); return; }
+  document.getElementById('monitor-status').className = 'status-msg';
+  renderTasks(data, true);
+};
+
+document.getElementById('btn-scout-answers').onclick = async () => {
+  if (!currentBoundaryId) { showStatus('monitor-status', 'Open a farm first.', 'error'); return; }
+  showStatus('monitor-status', 'Reading the scouts\' answers from Geohub…', 'info');
+  const r = await fetch(`${API_BASE}/scouting/refresh`, { method: 'POST' });
+  const out = await r.json();
+  if (!r.ok && out.code !== 'no_scouting_form') { showStatus('monitor-status', out.detail || 'Geohub could not be reached.', 'error'); return; }
+  const res = await fetch(`${API_BASE}/scouting/tasks?boundary_id=${currentBoundaryId}`);
+  if (res.ok) renderTasks(await res.json(), false);
+  showStatus('monitor-status', r.ok ? `${out.tasks_updated} task(s) updated from ${out.records_read} scouting record(s).` : out.detail, r.ok ? 'success' : 'info');
+};
 </script>
 </body>
 </html>
