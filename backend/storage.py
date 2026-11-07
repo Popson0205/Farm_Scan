@@ -1,4 +1,4 @@
-"""Files FarmScan keeps: drone orthomosaics and the soil dataset. In the platform's S3-compatible bucket, under
+"""Files FarmScan keeps: the soil dataset (HWSD). In the platform's S3-compatible bucket, under
 S3_PREFIX (farm/), when S3 is set up; otherwise in backend/uploads (development and tests).
 
 Raster libraries read local files, so a stored file is fetched into a local cache before it is read (and stays there

@@ -98,24 +98,6 @@ def test_single_observation_is_insufficient():
     assert m.analyze_trend([obs("2026-07-01", .6)])["status"] == "insufficient_data"
 
 
-# ------------------------------ plot ranking ------------------------------
-
-def test_plot_ranking_flags_weak_plot():
-    plots = [{"plot_id": i, "mean": v} for i, v in
-             enumerate([.70, .71, .69, .70, .72, .70, .71, .45])]
-    plots.append({"plot_id": 99, "mean": None})
-    r = m.rank_plots(plots)
-    weakest = r["plots"][0]
-    assert weakest["plot_id"] == 7 and weakest["flag"] == "underperforming"
-    assert r["summary"]["unranked_no_data"] == 1
-    assert r["summary"]["headroom_median_to_top_quartile"] >= 0
-
-
-def test_plot_ranking_needs_three_plots():
-    with pytest.raises(ValueError):
-        m.rank_plots([{"plot_id": 1, "mean": .5}, {"plot_id": 2, "mean": .6}])
-
-
 # ------------------------------ rate plan ------------------------------
 
 def _zones(counts):

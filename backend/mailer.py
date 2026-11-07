@@ -1,5 +1,6 @@
-"""Email for FarmScan's weekly alerts, through the same provider as Geohub: Resend (RESEND_API_KEY) or SMTP
-(SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD), from MAIL_FROM. With neither set, nothing is sent (and the alerts
+"""Email for FarmScan's weekly alerts, through the same email service as Geohub and the other GeoEstate apps: set the
+same variables Geohub has — Resend (RESEND_API_KEY) or SMTP (SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD), with
+MAIL_FROM and MAIL_REPLY_TO. With neither set, nothing is sent (and the alerts
 can still be read in FarmScan)."""
 import os
 import smtplib
@@ -21,7 +22,8 @@ def send(to: str, subject: str, text: str, html: str | None = None) -> None:
         return
     if key := os.environ.get("RESEND_API_KEY"):
         r = httpx.post("https://api.resend.com/emails", headers={"Authorization": f"Bearer {key}"}, timeout=20,
-                       json={"from": sender, "to": [to], "subject": subject, "text": text, **({"html": html} if html else {})})
+                       json={"from": sender, "to": [to], "subject": subject, "text": text, **({"html": html} if html else {}),
+                             **({"reply_to": os.environ["MAIL_REPLY_TO"]} if os.environ.get("MAIL_REPLY_TO") else {})})
         r.raise_for_status()
         return
     host = os.environ.get("SMTP_HOST")
@@ -29,6 +31,8 @@ def send(to: str, subject: str, text: str, html: str | None = None) -> None:
         raise RuntimeError("No email provider is set (RESEND_API_KEY or SMTP_HOST)")
     msg = EmailMessage()
     msg["From"], msg["To"], msg["Subject"] = sender, to, subject
+    if os.environ.get("MAIL_REPLY_TO"):
+        msg["Reply-To"] = os.environ["MAIL_REPLY_TO"]
     msg.set_content(text)
     if html:
         msg.add_alternative(html, subtype="html")

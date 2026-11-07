@@ -76,18 +76,13 @@ def test_problem_areas_requires_processed_index_and_valid_index(bid):
     assert client.post("/api/monitoring/problem-areas", data={"boundary_id": bid, "index": "ndwi"}).status_code == 400
 
 
-def test_plot_performance_and_excel_still_work(bid):
-    client.post("/api/imagery/process-demo", data={"boundary_id": bid, "index": "ndvi", "obs_date": "2026-08-01"})
-    assert client.post("/api/plots/generate-grid", data={"boundary_id": bid, "rows": 3, "cols": 4}).status_code == 200
-    z = client.post("/api/plots/zonal-stats", data={"boundary_id": bid, "index": "ndvi"})
-    assert z.status_code == 200 and z.json()["plot_count"] == 12
-    p = client.post("/api/plots/performance", data={"boundary_id": bid, "index": "ndvi"})
-    assert p.status_code == 200
-    body = p.json()
-    assert body["summary"]["plots_ranked"] == 12
-    assert all("z_score" in x and x["flag"] in ("underperforming", "watch", "ok", "top") for x in body["plots"])
-    x = client.get("/api/export/excel/plots", params={"boundary_id": bid, "index": "ndvi"})
-    assert x.status_code == 200 and x.content[:2] == b"PK"
+def test_plot_and_drone_tools_are_gone(bid):
+    """Plots, per-plot statistics, drone orthomosaics and plant counts were removed (they need drone-grade imagery)."""
+    for path in ("/api/plots/generate-grid", "/api/plots/zonal-stats", "/api/plots/performance", "/api/plots/import",
+                 "/api/drone/upload", "/api/drone/plant-count", "/api/drone/plant-count-per-plot"):
+        assert client.post(path, data={"boundary_id": bid}).status_code in (404, 405), path
+    for path in (f"/api/plots/{bid}", "/api/export/excel/plots", "/api/export/shp/plots"):
+        assert client.get(path, params={"boundary_id": bid}).status_code in (404, 405), path
 
 
 def test_rate_plan_and_export(bid):
