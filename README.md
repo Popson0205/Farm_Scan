@@ -146,6 +146,21 @@ FarmScan is one of the GeoEstate products. It has no accounts of its own:
 - No clear crop cycle (amplitude under 0.15 NDVI / 0.10 RVI), too few images, already green at the first image, or not
   yet harvested at the last are said as such rather than guessed.
 
+### Weekly alerts and verification reports
+
+- **Weekly alerts** (`GET /api/alerts`, plan feature `alerts`): for every farm, a dry spell in the rainy season (10+
+  days without ≥ 1 mm and little forecast), heavy rain (≥ 50 mm) or heat (≥ 38 °C) in the next week (Open-Meteo),
+  satellite fire detections on or within 500 m of the farm in the last 7 days (NASA FIRMS, needs `FIRMS_MAP_KEY`, free
+  at firms.modaps.eosdis.nasa.gov/api/map_key), and crop drops in the farm's timeline in the last 21 days. People who
+  ask for them get them by email once a week (an hourly check in the service; one email per organization per week,
+  only while its licence includes alerts and is current). Email goes through `RESEND_API_KEY` or `SMTP_*`, from
+  `MAIL_FROM` — the same as Geohub's.
+- **Verification report** (`POST /api/reports/verification`, plan feature `verification`): a numbered PDF with the
+  farm's measured (and declared) area and outline, its crop seasons from the timeline (last three years), rainfall
+  against the 10-year average, and the title status from GeoEstate Land Registry where `LAND_API` and
+  `LAND_PLATFORM_KEY` are set (as for LandCheck). Kept as issued; anyone checks it at `/verify.html?code=FSV-…`
+  (which shows only the farm's name, area and place, not the farmer's details).
+
 ### Deploying (Railway)
 
 The service is `backend/` (Railpack, `uvicorn main:app`), which also serves the web app. Variables:
@@ -159,6 +174,9 @@ The service is `backend/` (Railpack, `uvicorn main:app`), which also serves the 
 | `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET`, `S3_REGION` | the platform bucket (same as Geohub's) |
 | `DEMO_TOOLS` | leave unset; `true` only on a demonstration copy (shows "practice with sample data") |
 | `OPEN_METEO_API_KEY` | optional: Open-Meteo's commercial key |
+| `RESEND_API_KEY` or `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASSWORD`, `MAIL_FROM` | weekly alert emails (as Geohub's) |
+| `FIRMS_MAP_KEY` | optional: NASA FIRMS key for fire alerts |
+| `LAND_API`, `LAND_PLATFORM_KEY` | optional: title status in verification reports (Land Registry's `PLATFORM_KEY`) |
 
 In Geohub: add `{"id": "farm", "redirect_uris": ["<APP_URL>/api/auth/callback"], "secret": "<ID_SECRET>"}` to
 `ID_CLIENTS`, and `farm=<APP_URL>` to `PRODUCT_URLS` (the app switcher).

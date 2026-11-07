@@ -368,6 +368,30 @@ def get_forecast(lat: float, lon: float, days: int = 7) -> dict:
     return {**fc, **forecast_advisories(fc)}
 
 
+def get_recent_and_ahead(lat: float, lon: float, past: int = 14, ahead: int = 7) -> dict:
+    """The last `past` days (modelled from observations) and the next `ahead` days, in one series: for alerts.
+    {"dates", "rain", "tmax", "today_index"}; cached 3 hours."""
+    key = f"ra:{round(lat, 2)}:{round(lon, 2)}:{past}:{ahead}"
+    hit = _cache_get(key, FORECAST_TTL_S)
+    if hit:
+        return hit["payload"]
+    try:
+        j = _get_json(_FORECAST_URL, {"latitude": round(lat, 4), "longitude": round(lon, 4),
+                                      "daily": "temperature_2m_max,precipitation_sum", "past_days": past,
+                                      "forecast_days": ahead, "timezone": "auto"})
+        d = j.get("daily") or {}
+        if not d.get("time"):
+            raise WeatherUnavailable("Open-Meteo returned no daily data")
+        out = {"dates": d["time"], "rain": d.get("precipitation_sum"), "tmax": d.get("temperature_2m_max"), "today_index": past}
+    except (WeatherUnavailable, requests.RequestException, ValueError) as e:
+        stale = _cache_get(key, FORECAST_TTL_S, allow_stale=True)
+        if not stale:
+            raise WeatherUnavailable(f"Weather unavailable: {e}")
+        return stale["payload"]
+    _cache_put(key, out)
+    return out
+
+
 def forecast_advisories(fc: dict) -> dict:
     """Plain-language, rule-based flags. Prompts to think, not agronomic orders."""
     rain = [0.0 if v is None else v for v in fc.get("rain", [])]

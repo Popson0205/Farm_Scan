@@ -323,6 +323,23 @@
       <div class="status-msg" id="monitor-status"></div>
     </div>
 
+    <div class="section" data-feature="alerts">
+      <h2>Weekly Alerts</h2>
+      <div class="hint" style="margin:0 0 10px;">Dry spells, heavy rain, heat, fires near the farms and crop drops, across all your farms: here, and by email every week if you ask.</div>
+      <button class="btn btn-secondary" id="btn-alerts">🔔 This week's alerts</button>
+      <button class="btn btn-secondary" id="btn-alerts-sub" style="margin-top:8px;">✉ Email me these every week</button>
+      <div id="alerts-box" style="display:none; margin-top:10px;"></div>
+      <div class="status-msg" id="alerts-status"></div>
+    </div>
+
+    <div class="section" data-feature="verification">
+      <h2>Verification Report</h2>
+      <div class="hint" style="margin:0 0 10px;">A numbered PDF for a lender, insurer or buyer: the farm's measured area, its crop seasons from the satellites, rainfall against normal and, where the land is on GeoEstate Land Registry, its title status. Anyone holding it can check it is genuine.</div>
+      <button class="btn btn-primary" id="btn-verify-report">📄 Issue a report for this farm</button>
+      <div id="reports-box" style="margin-top:10px;"></div>
+      <div class="status-msg" id="report-status"></div>
+    </div>
+
     <div class="section" data-feature="suitability">
       <h2>Site Suitability</h2>
       <div class="hint" style="margin:0 0 10px;">Soil (FAO HWSD) + weather history (Open-Meteo) &rarr; which crops fit this farm, when to plant, and what limits them. Screening-grade: confirm with a soil test.</div>
@@ -1838,6 +1855,61 @@ document.getElementById('btn-season-build').onclick = async () => {
   }
   showStatus('monitor-status', job.message || job.status, job.status === 'done' ? 'success' : 'error');
   if (job.status === 'done' && currentBoundaryId === farm) await showSeason();
+};
+
+// =====================================================================
+// Weekly alerts, verification reports
+// =====================================================================
+const ALERT_ICON = { dry_spell: '☀', heavy_rain: '🌧', heat: '🌡', fire: '🔥', crop_drop: '📉' };
+let alertsSubscribed = false;
+function setSubButton() {
+  document.getElementById('btn-alerts-sub').textContent = alertsSubscribed ? '✉ Stop the weekly email' : '✉ Email me these every week';
+}
+document.getElementById('btn-alerts').onclick = async () => {
+  showStatus('alerts-status', 'Checking every farm…', 'info');
+  const res = await fetch(`${API_BASE}/alerts`);
+  const a = await res.json();
+  if (!res.ok) { showStatus('alerts-status', a.detail || 'Could not check.', 'error'); return; }
+  alertsSubscribed = a.subscribed; setSubButton();
+  const box = document.getElementById('alerts-box');
+  box.style.display = 'block';
+  const farms = a.farms.map(f => `<div class="task-row"><b class="ref" style="cursor:pointer" data-id="${esc(f.boundary_id)}">${esc(f.name)}</b>
+      ${f.alerts.map(x => `<div style="margin-top:4px;">${ALERT_ICON[x.kind] || '•'} ${esc(x.words)}</div>`).join('')}</div>`).join('');
+  box.innerHTML = `<div class="hint" style="margin:0 0 6px;">${a.alert_count} alert(s) on ${a.farms.length} of ${a.farms_checked} farms.${a.unavailable.length ? ' Not checked: ' + esc(a.unavailable.join(', ')) + '.' : ''}</div>${farms || '<div class="hint">Nothing to flag this week.</div>'}
+    ${a.subscribed && !a.email_set_up ? '<div class="sample-note">Email is not set up on this FarmScan yet, so the weekly email is not being sent.</div>' : ''}
+    <div class="hint">Weather is modelled for the area, not measured on the farm; a fire detection may be nearby burning. Prompts to check, not diagnoses.</div>`;
+  box.querySelectorAll('[data-id]').forEach(el => el.onclick = () => openFarm(el.dataset.id));
+  document.getElementById('alerts-status').className = 'status-msg';
+};
+document.getElementById('btn-alerts-sub').onclick = async () => {
+  const res = await fetch(`${API_BASE}/alerts/subscribe`, { method: alertsSubscribed ? 'DELETE' : 'POST' });
+  const r = await res.json();
+  if (!res.ok) { showStatus('alerts-status', r.detail || 'Could not change it.', 'error'); return; }
+  alertsSubscribed = r.subscribed; setSubButton();
+  showStatus('alerts-status', r.subscribed ? `The weekly alerts will be emailed to ${r.email}.` : 'The weekly email is stopped.', 'success');
+};
+
+async function loadReports() {
+  const box = document.getElementById('reports-box');
+  if (!currentBoundaryId || !ME || !ME.features.includes('verification')) { box.innerHTML = ''; return; }
+  const res = await fetch(`${API_BASE}/reports?boundary_id=${currentBoundaryId}`);
+  const list = res.ok ? await res.json() : [];
+  box.innerHTML = list.map(r => `<div class="farm-item" style="display:flex; justify-content:space-between;">
+      <span>${esc(r.code)}<span class="area" style="display:block;">${esc(new Date(r.created_at).toLocaleDateString('en-GB'))} · ${esc(r.created_by || '')}</span></span>
+      <a href="${API_BASE}/reports/${esc(r.id)}/pdf" target="_blank" rel="noopener">PDF</a></div>`).join('');
+}
+const _openFarm2 = openFarm;
+openFarm = async function (id) { await _openFarm2(id); loadReports(); };
+document.getElementById('btn-verify-report').onclick = async () => {
+  if (!currentBoundaryId) { showStatus('report-status', 'Open a farm first.', 'error'); return; }
+  showStatus('report-status', 'Issuing the report…', 'info');
+  const form = new FormData(); form.append('boundary_id', currentBoundaryId);
+  const res = await fetch(`${API_BASE}/reports/verification`, { method: 'POST', body: form });
+  const r = await res.json();
+  if (!res.ok) { showStatus('report-status', r.detail || 'Could not issue it.', 'error'); return; }
+  showStatus('report-status', `Report ${r.code} issued.${r.warnings.length ? ' ' + r.warnings.join(' ') : ''}`, r.warnings.length ? 'info' : 'success');
+  window.open(r.pdf, '_blank');
+  loadReports();
 };
 </script>
 </body>

@@ -20,7 +20,8 @@ AT, RT = "farm_at", "farm_rt"
 ROLE_OF = {"owner": "manager", "admin": "manager", "member": "agronomist", "collector": "viewer", "viewer": "viewer"}
 RANK = {"viewer": 0, "agronomist": 1, "manager": 2}
 FEATURE_WORDS = {"monitoring": "Satellite monitoring", "zones": "Management zones", "suitability": "Crop suitability",
-                 "drone": "Drone imagery", "plant_count": "Plant counts", "prescriptions": "Variable-rate prescriptions"}
+                 "drone": "Drone imagery", "plant_count": "Plant counts", "prescriptions": "Variable-rate prescriptions",
+                 "alerts": "Weekly farm alerts", "verification": "Farm verification reports"}
 gid: GeoEstateID | None = None       # tests swap this for one that talks to a stand-in Geohub
 
 
