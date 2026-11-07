@@ -30,6 +30,8 @@ def stubbed(tmp_path, monkeypatch):
     db = tmp_path / "hwsd2.sqlite"
     build_hwsd_db(db, unit(101, 100, sand=52, silt=18, clay=30, ph=5.8, oc=1.1, cec=9, drainage=3))
     monkeypatch.setenv("HWSD2_DB", str(db))
+    (tmp_path / "HWSD2.bil").write_bytes(b"")                  # "installed" (sampling is stubbed below)
+    monkeypatch.setenv("HWSD2_RASTER", str(tmp_path / "HWSD2.bil"))
     monkeypatch.setattr(soil, "smu_histogram", lambda geom: {101: 2})
     series = make_series()
     monkeypatch.setattr(weather, "get_daily_history", lambda lat, lon, years=10, end=None: series)
@@ -48,9 +50,12 @@ def test_soil_profile_endpoint(bid, stubbed):
 
 
 def test_soil_endpoint_explains_missing_dataset(bid, tmp_path, monkeypatch):
+    """Without HWSD, soil comes from SoilGrids; when that cannot be reached either, it says so (503, not a crash)."""
+    import soilgrids
     monkeypatch.setenv("HWSD2_RASTER", str(tmp_path / "none.bil"))
+    monkeypatch.setattr(soilgrids, "_fetch", lambda lat, lon: (_ for _ in ()).throw(soilgrids.SoilGridsUnavailable("SoilGrids could not be reached (test).")))
     r = client.get("/api/soil/profile", params={"boundary_id": bid})
-    assert r.status_code == 503 and "build_hwsd_sqlite" in r.json()["detail"]
+    assert r.status_code == 503 and "SoilGrids could not be reached" in r.json()["detail"]
     assert client.get("/api/data-status").json()["soil"]["ready"] is False
 
 

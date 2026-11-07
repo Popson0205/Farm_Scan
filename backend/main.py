@@ -47,6 +47,7 @@ log = logging.getLogger("farmscan")
 # In-memory cache of the last computed index result per (boundary_id, index), so plot stats / zones / exports can
 # reuse the raster instead of recomputing. Farm ids are checked against the person's organization before use.
 _RESULT_CACHE: dict[str, dict] = {}
+RESULT_CACHE_MAX = 40
 
 
 @asynccontextmanager
@@ -390,8 +391,28 @@ def _colorize(index_array: np.ndarray, colormap: str, value_range: tuple) -> Ima
         )
 
     alpha = np.where(np.isnan(index_array), 0, 255).astype(np.uint8)
-    rgba = np.dstack([rgb.astype(np.uint8), alpha])
+    rgba = np.dstack([np.nan_to_num(rgb).astype(np.uint8), alpha])
     return Image.fromarray(rgba, mode="RGBA")
+
+
+def _to_wgs84(arr: np.ndarray, transform, crs) -> tuple[np.ndarray, list]:
+    """The index on a longitude/latitude grid, and its Leaflet bounds [[south, west], [north, east]]: an image overlay
+    on a web map is drawn in latitude/longitude, so a UTM grid laid on it straight would sit off by up to a pixel at
+    the edges and turn with the grid's convergence (about 2–20 m across a farm in Nigeria)."""
+    from rasterio.crs import CRS
+    from rasterio.transform import array_bounds
+    from rasterio.warp import Resampling as R, calculate_default_transform, reproject
+    h, w = arr.shape
+    if crs is None or CRS.from_user_input(crs) == CRS.from_epsg(4326):
+        south, west, north, east = (lambda b: (b[1], b[0], b[3], b[2]))(array_bounds(h, w, transform))
+        return arr, [[south, west], [north, east]]
+    left, bottom, right, top = array_bounds(h, w, transform)
+    dst_t, dw, dh = calculate_default_transform(crs, "EPSG:4326", w, h, left, bottom, right, top)
+    out = np.full((dh, dw), np.nan, dtype=np.float32)
+    reproject(arr.astype(np.float32), out, src_transform=transform, src_crs=crs, dst_transform=dst_t, dst_crs="EPSG:4326",
+              resampling=R.nearest, src_nodata=np.nan, dst_nodata=np.nan)
+    west, north = dst_t.c, dst_t.f
+    return out, [[north + dh * dst_t.e, west], [north, west + dw * dst_t.a]]
 
 
 def _finish_processing(index: str, band_arrays: dict, out_meta: dict,
@@ -405,25 +426,27 @@ def _finish_processing(index: str, band_arrays: dict, out_meta: dict,
         field_mask = ~np.isnan(idx_array)
 
     spec = INDEX_REGISTRY[index]
-    img = _colorize(idx_array, spec["colormap"], spec["range"])
+    shown, overlay_bounds = _to_wgs84(idx_array, out_meta["transform"], out_meta.get("crs"))
+    img = _colorize(shown, spec["colormap"], spec["range"])
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     png_bytes = buf.getvalue()
     png_b64 = base64.b64encode(png_bytes).decode()
 
-    geom = shape(boundary_geojson)
-    minx, miny, maxx, maxy = geom.bounds
-
     stats = zonal_stats(idx_array, field_mask)
 
     # cache the raw result so /plots, /zones, /export endpoints can reuse it
     if boundary_id:
-        _RESULT_CACHE[f"{boundary_id}:{index}"] = {
+        key = f"{boundary_id}:{index}"
+        _RESULT_CACHE.pop(key, None)
+        while len(_RESULT_CACHE) >= RESULT_CACHE_MAX:            # keep memory bounded: drop the oldest result
+            _RESULT_CACHE.pop(next(iter(_RESULT_CACHE)))
+        _RESULT_CACHE[key] = {
             "array": idx_array,
             "transform": out_meta["transform"],
             "crs": out_meta["crs"],
-            "png_bytes": png_bytes,
+            "png_bytes": png_bytes, "overlay_bounds": overlay_bounds,
             "stats": stats,
             "label": spec["label"],
             "obs_date": obs_date, "source": source,
@@ -445,7 +468,7 @@ def _finish_processing(index: str, band_arrays: dict, out_meta: dict,
         "label": spec["label"],
         "demo_mode": demo,
         "overlay_png_base64": png_b64,
-        "overlay_bounds": [[miny, minx], [maxy, maxx]],  # Leaflet [[south, west], [north, east]]
+        "overlay_bounds": overlay_bounds,  # Leaflet [[south, west], [north, east]]
         "value_range": spec["range"],
         "colormap": spec["colormap"],
         "stats": stats,
@@ -626,30 +649,36 @@ def get_annotations(boundary_id: str, user=Depends(reader)):
 
 @app.post("/api/share")
 def create_share(boundary_id: str = Form(...), index: str = Form(None), user=Depends(writer)):
-    token = annotations_mod.create_share_link(_farm(user, boundary_id)["id"], index, user["name"])
-    return {"token": token, "share_path": f"/api/share/{token}"}
+    """A read-only link to the farm and, if one has been run, its latest result for `index` (kept as it is now)."""
+    farm = _farm(user, boundary_id)
+    cached = _RESULT_CACHE.get(f"{farm['id']}:{index}") if index else None
+    token = annotations_mod.create_share_link(farm["id"], index if cached else None, user["name"])
+    if cached:
+        with db.tx() as conn:
+            conn.execute("UPDATE share_links SET overlay_png = %s, overlay_bounds = %s, stats = %s, label = %s, obs_date = %s, "
+                         "source = %s WHERE token = %s",
+                         (cached["png_bytes"], Jsonb(cached["overlay_bounds"]), Jsonb(cached["stats"]), cached["label"],
+                          cached.get("obs_date"), cached.get("source"), token))
+    return {"token": token, "share_path": f"/api/share/{token}", "share_url": f"{settings.app_url}/share.html?t={token}",
+            "with_result": bool(cached)}
 
 
 @app.get("/api/share/{token}")
 def resolve_share(token: str):
-    """A read-only view of one farm (and result) for anyone with the link: no sign-in."""
-    link = annotations_mod.resolve_share_link(token)
-    if not link:
-        raise HTTPException(404, "Share link not found or expired")
+    """A read-only view of one farm (and the result shared with it) for anyone with the link: no sign-in."""
     with db.tx() as conn:
-        b = conn.execute("SELECT id::text AS id, name, geojson, area_ha, created_at::text AS created_at FROM boundaries "
-                         "WHERE id = %s", (link["boundary_id"],)).fetchone()
-    if not b:
+        row = conn.execute(
+            "SELECT s.index_name, s.overlay_png, s.overlay_bounds, s.stats, s.label, s.obs_date, s.source, s.created_by, "
+            "s.created_at::text AS shared_at, b.id::text AS id, b.name, b.geojson, b.area_ha FROM share_links s "
+            "JOIN boundaries b ON b.id = s.boundary_id WHERE s.token = %s", (token[:64],)).fetchone()
+    if not row:
         raise HTTPException(404, "Share link not found or expired")
-    result = {"boundary": {"boundary_id": b["id"], "name": b["name"], "geojson": b["geojson"], "area_ha": b["area_ha"],
-                           "created_at": b["created_at"]}, "index": link["index_name"]}
-    if link["index_name"]:
-        cached = _RESULT_CACHE.get(f"{link['boundary_id']}:{link['index_name']}")
-        if cached:
-            result["overlay_png_base64"] = base64.b64encode(cached["png_bytes"]).decode()
-            result["stats"] = cached["stats"]
-            result["source"] = cached.get("source")
-    return result
+    out = {"boundary": {"boundary_id": row["id"], "name": row["name"], "geojson": row["geojson"], "area_ha": row["area_ha"]},
+           "index": row["index_name"], "shared_by": row["created_by"], "shared_at": row["shared_at"]}
+    if row["overlay_png"]:
+        out |= {"overlay_png_base64": base64.b64encode(bytes(row["overlay_png"])).decode(), "overlay_bounds": row["overlay_bounds"],
+                "stats": row["stats"], "label": row["label"], "obs_date": row["obs_date"], "source": row["source"]}
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -735,6 +764,27 @@ def suitability_analyze(boundary_id: str = Form(...), crops: str = Form(""), pla
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"boundary_id": boundary_id, **result}
+
+
+@app.get("/api/setup", summary="What this FarmScan is connected to (for the person deploying it; no secrets)")
+def setup_check():
+    """Each part FarmScan needs, and whether it is set up here: so a part that "does not work" can be traced to a
+    missing variable rather than guessed at."""
+    import os
+    checks = {
+        "sign_in": {"ok": bool(settings.id_secret) and settings.app_url.startswith("https://"),
+                    "what": "GeoEstate ID: ID_SECRET set, APP_URL is this service's https address",
+                    "app_url": settings.app_url, "geohub": settings.geohub_url},
+        "database": {"ok": True, "what": "PostgreSQL + PostGIS (farm schema)"},
+        "bucket": {"ok": settings.s3_on, "what": "S3_* (the soil dataset, if HWSD is uploaded); optional"},
+        "email": {"ok": mailer.configured(), "what": f"weekly alert emails: {mailer.backend()}"},
+        "fires": {"ok": bool(os.environ.get("FIRMS_MAP_KEY")), "what": "FIRMS_MAP_KEY for fire alerts; optional"},
+        "land_registry": {"ok": bool(os.environ.get("LAND_API") and os.environ.get("LAND_PLATFORM_KEY")),
+                          "what": "LAND_API + LAND_PLATFORM_KEY: title status in verification reports; optional"},
+        "soil": {"ok": True, "what": "HWSD (installed)" if soil_mod.hwsd_installed() else "ISRIC SoilGrids (online; HWSD not installed)"},
+        "sample_data": {"ok": not settings.demo_tools, "what": "DEMO_TOOLS is off (sample data hidden from customers)"},
+    }
+    return {"ready": all(c["ok"] for k, c in checks.items() if k in ("sign_in", "database")), "checks": checks}
 
 
 @app.get("/api/health")
@@ -1220,10 +1270,20 @@ def org_alerts(org_id: str, today: date_cls | None = None) -> dict:
                 found += alerts_mod.fire_alerts(fires, f["geojson"])
         except Exception:
             unavailable.add("fire")
-        for index, sources in (("ndvi", ("live",)), ("rvi", ("sentinel-1",))):
-            obs = [o for o in monitoring_mod.list_observations(f["id"], index) if o["source"] in sources]
+        series = {index: [o for o in monitoring_mod.list_observations(f["id"], index) if o["source"] in sources]
+                  for index, sources in (("ndvi", ("live",)), ("rvi", ("sentinel-1",)))}
+        # A fall after the season's peak is the crop drying down for harvest, not a problem: only falls before the
+        # peak (or with no season read) are flagged.
+        reading = season_mod.season_reading(
+            [(o["obs_date"], o["mean"]) for o in series["ndvi"]
+             if (o["valid_fraction"] or 0) >= monitoring_mod.MIN_VALID_FRACTION and o["mean"] is not None],
+            [(o["obs_date"], o["median"]) for o in series["rvi"] if o["median"] is not None])
+        peak = (reading.get("peak") or {}).get("date") if reading.get("based_on") else None
+        drops = []
+        for index, obs in series.items():
             if obs:
-                found += alerts_mod.crop_alerts(monitoring_mod.analyze_trend(obs), index, today)
+                drops += alerts_mod.crop_alerts(monitoring_mod.analyze_trend(obs), index, today, after_peak=peak)
+        found += drops[:1]                                      # one crop alert per farm (NDVI first, then radar)
         if found:
             out.append({"boundary_id": f["id"], "name": f["name"], "alerts": found})
     return {"farms_checked": len(farms), "farms": out, "alert_count": sum(len(x["alerts"]) for x in out),

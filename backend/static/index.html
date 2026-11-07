@@ -374,7 +374,7 @@
 
     <div class="section" data-feature="suitability">
       <h2>Site Suitability</h2>
-      <div class="hint" style="margin:0 0 10px;">Soil (FAO HWSD) + weather history (Open-Meteo) &rarr; which crops fit this farm, when to plant, and what limits them. Screening-grade: confirm with a soil test.</div>
+      <div class="hint" style="margin:0 0 10px;">Soil (FAO HWSD, or ISRIC SoilGrids) + weather history (Open-Meteo) &rarr; which crops fit this farm, when to plant, and what limits them. Screening-grade: confirm with a soil test.</div>
       <label>Planting date <span style="font-weight:400; color:#5c6b62;">(optional &mdash; blank = find the best window)</span></label>
       <input type="text" id="suit-planting" placeholder="e.g. 05-20 or 2027-05-20">
       <button class="btn btn-primary" id="btn-suitability" style="margin-top:8px;">🌱 Analyze crop suitability</button>
@@ -575,6 +575,17 @@ async function openFarm(id) {
     const f = await res.json();
     const known = currentBoundaries.find(x => x.id === id);
     if (known) known.geojson = f.geojson;
+    if (currentBoundaryId !== id) {                    // scenes and results belong to the farm they were found for
+      selectedLiveScene = null;
+      document.getElementById('scene-list').innerHTML = '';
+      document.getElementById('btn-process-live').disabled = true;
+      document.getElementById('results-section').style.display = 'none';
+      document.getElementById('problem-box').style.display = 'none';
+      document.getElementById('season-box').style.display = 'none';
+      ['search-status', 'process-status', 'monitor-status'].forEach(i => { const el = document.getElementById(i); if (el) el.className = 'status-msg'; });
+      if (typeof problemLayer !== 'undefined' && problemLayer) { map.removeLayer(problemLayer); problemLayer = null; }
+      if (typeof zonesLayer !== 'undefined' && zonesLayer) { map.removeLayer(zonesLayer); zonesLayer = null; }
+    }
     currentBoundaryId = id;
     drawGeoJSONOnMap(f.geojson);
     map.fitBounds(L.geoJSON(f.geojson).getBounds());
@@ -619,7 +630,7 @@ document.getElementById('btn-search-live').onclick = async () => {
     showStatus('search-status', `Showing the best ${data.scenes.length} scene(s)${more}, clearest first. Each covers your whole plot.`, 'success');
     renderSceneList(data.scenes);
   } catch (err) {
-    showStatus('search-status', `${err.message} — try "Run (Demo data)" instead if the backend has no internet access.`, 'error');
+    showStatus('search-status', esc(err.message), 'error');
   }
 };
 
@@ -782,9 +793,11 @@ document.getElementById('btn-share').onclick = async () => {
   try {
     const res = await fetch(`${API_BASE}/share`, { method: 'POST', body: form });
     const data = await res.json();
-    const fullUrl = `${API_BASE}${data.share_path}`;
-    await navigator.clipboard.writeText(fullUrl).catch(() => {});
-    showStatus('export-status', `Share link copied: ${fullUrl}`, 'success');
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    const fullUrl = data.share_url || `${location.origin}/share.html?t=${data.token}`;
+    const copied = await navigator.clipboard.writeText(fullUrl).then(() => true).catch(() => false);
+    showStatus('export-status', '', 'success');
+    document.getElementById('export-status').innerHTML = `${copied ? 'Link copied' : 'Read-only link'}${data.with_result ? '' : ' (the boundary only: run an index first to share a result)'}: <a href="${esc(fullUrl)}" target="_blank" rel="noopener">${esc(fullUrl)}</a>`;
   } catch (err) {
     showStatus('export-status', `Error: ${err.message}`, 'error');
   }
@@ -987,7 +1000,7 @@ async function loadAnnotations() {
 }
 
 // =====================================================================
-// 6c. Site suitability: soil (HWSD) + weather -> ranked crops, planting windows
+// 6c. Site suitability: soil (HWSD or SoilGrids) + weather -> ranked crops, planting windows
 // =====================================================================
 const CLASS_COLOR = { S1: '#2c7a45', S2: '#6a9f3a', S3: '#e08a2c', N: '#b3462c' };
 const SCORE_COLOR = s => s >= 0.8 ? '#2c7a45' : s >= 0.6 ? '#6a9f3a' : s >= 0.4 ? '#e08a2c' : '#b3462c';
@@ -1302,7 +1315,7 @@ document.getElementById('btn-send-scouts').onclick = async () => {
     showStatus('monitor-status', `Run ${selectedIndex.toUpperCase()} for this farm first (steps 1–3, then ▶ Run).`, 'error'); return;
   }
   const st = await scoutingSetup();
-  if (!st.scouting_form) return;
+  if (!st.scouting_form) { showStatus('monitor-status', 'Choose the Geohub scouting form first (below).', 'error'); return; }
   showStatus('monitor-status', 'Making scouting tasks…', 'info');
   const form = new FormData();
   form.append('boundary_id', currentBoundaryId); form.append('index', selectedIndex);

@@ -296,7 +296,19 @@ def profile_from_parts(agg: dict, smu_pixels: dict[int, int]) -> dict:
     }
 
 
+def hwsd_installed() -> bool:
+    return raster_path().exists() and db_path().exists()
+
+
 def soil_profile(boundary_geojson: dict) -> dict:
+    """HWSD when its files are installed (drainage, salinity, base saturation as well); otherwise SoilGrids, so crop
+    suitability works on any deployment."""
+    if not hwsd_installed():
+        import soilgrids
+        try:
+            return soilgrids.soil_profile(boundary_geojson)
+        except soilgrids.SoilGridsUnavailable as e:
+            raise SoilDataUnavailable(str(e))
     smu = smu_histogram(boundary_geojson)
     rows = load_layer_rows(list(smu))
     if not rows:

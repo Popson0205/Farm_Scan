@@ -88,11 +88,12 @@ def smooth_daily(points: list[tuple[str, float]], window: int = SMOOTH_DAYS) -> 
 
 
 def _gap_around(x_obs: np.ndarray, day: float) -> float:
-    """Half the gap between the observations either side of a day: how far off a crossing found there can be."""
-    before, after = x_obs[x_obs <= day], x_obs[x_obs >= day]
+    """Half the gap between the observations either side of a day (strictly before and after): how far off a crossing
+    found there can be. A smoothed curve crossing on an image date is no more certain than the spacing of the images."""
+    before, after = x_obs[x_obs < day], x_obs[x_obs > day]
     if not len(before) or not len(after):
         return float("inf")
-    return float(after.min() - before.max()) / 2.0
+    return float(after.min() - before.max()) / 2.0             # an image on the day itself still leaves its neighbours
 
 
 def phenology(points: list[tuple[str, float]], kind: str = "ndvi") -> dict:
@@ -196,7 +197,6 @@ S1_COLLECTION = "sentinel-1-rtc"
 
 def radar_scenes(geometry: dict, start: str, end: str, limit: int = 60) -> list[dict]:
     """Sentinel-1 radiometrically terrain-corrected scenes covering the whole farm, oldest first, one per date."""
-    import planetary_computer
     from pystac_client import Client
     from stac_client import STAC_API_URL, MIN_COVERAGE, coverage_fraction
 
@@ -208,7 +208,7 @@ def radar_scenes(geometry: dict, start: str, end: str, limit: int = 60) -> list[
             by_day.setdefault((item.properties.get("datetime") or "")[:10], item)
     out = []
     for day in sorted(by_day)[-max(1, int(limit)):]:
-        s = planetary_computer.sign(by_day[day])
+        s = by_day[day]                      # links are signed when read (stac_client.signed)
         if "vv" in s.assets and "vh" in s.assets:
             out.append({"scene_id": s.id, "date": day, "vv": s.assets["vv"].href, "vh": s.assets["vh"].href,
                         "orbit": s.properties.get("sat:orbit_state"), "platform": s.properties.get("platform")})
@@ -220,10 +220,11 @@ def radar_arrays(scene: dict, geometry: dict) -> tuple[np.ndarray, np.ndarray]:
     import rasterio
     from rasterio.mask import mask as rio_mask
     from rasterio.warp import transform_geom
+    from stac_client import signed
 
     out = []
     for key in ("vv", "vh"):
-        with rasterio.open(scene[key]) as src:
+        with rasterio.open(signed(scene[key])) as src:
             g = transform_geom("EPSG:4326", src.crs, geometry)
             arr, _ = rio_mask(src, [g], crop=True, filled=True, nodata=np.nan)
             a = arr[0].astype("float32")

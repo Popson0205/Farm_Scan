@@ -45,7 +45,7 @@ def test_reads_green_up_peak_and_harvest():
     p = season.phenology(obs(), "ndvi")
     assert p["ok"] and p["amplitude"] > 0.45
     g = date.fromisoformat(p["greenup"]["date"])
-    assert abs((g - true_crossing(0.2, True)).days) <= 10 and p["greenup"]["plus_minus_days"] <= 5
+    assert abs((g - true_crossing(0.2, True)).days) <= 10 and p["greenup"]["plus_minus_days"] <= 10
     e = date.fromisoformat(p["end"]["date"])
     assert abs((e - true_crossing(0.5, False)).days) <= 10
     pk = date.fromisoformat(p["peak"]["date"])
@@ -154,4 +154,4 @@ def test_radar_wins_when_clouds_leave_a_gap_at_green_up():
     radar = [(d, 0.25 + 0.5 * (v - 0.2) / 0.55) for d, v in obs(every=12, noise=0.03, seed=3)]
     r = season.season_reading(optical, radar)
     assert r["optical"]["ok"] and r["optical"]["greenup"]["plus_minus_days"] > 30
-    assert r["based_on"] == "rvi" and "gap" in r["note"] and r["greenup"]["plus_minus_days"] <= 6
+    assert r["based_on"] == "rvi" and "gap" in r["note"] and r["greenup"]["plus_minus_days"] <= 12

@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Shared farm · GeoEstate FarmScan</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
+<style>
+  :root { --green: #1f5c33; --ink: #1a1f1c; --muted: #5c6b62; --border: #dde5df; --bg: #f7f4ee; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif; color: var(--ink); background: var(--bg);
+         display: flex; flex-direction: column; }
+  header { background: linear-gradient(135deg, #14361f, var(--green)); color: #fff; padding: 12px 16px; display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+  header b { font-size: 16px; } header span { font-size: 13px; opacity: .85; }
+  #map { flex: 1; min-height: 320px; }
+  .panel { background: #fff; border-top: 1px solid var(--border); padding: 12px 16px; font-size: 13px; display: flex; gap: 18px; flex-wrap: wrap; }
+  .panel div { min-width: 90px; } .panel small { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .note { color: var(--muted); font-size: 12px; padding: 0 16px 12px; background: #fff; }
+</style>
+</head>
+<body>
+<header><b>🌾 GeoEstate FarmScan</b><span id="title">Shared farm</span></header>
+<div id="map" role="region" aria-label="Map of the shared farm"></div>
+<div class="panel" id="panel"></div>
+<div class="note" id="note"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script>
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const map = L.map('map');
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  { maxZoom: 19, attribution: 'Imagery &copy; Esri, Maxar, Earthstar Geographics' }).addTo(map);
+(async () => {
+  const t = new URLSearchParams(location.search).get('t') || '';
+  const res = await fetch(`/api/share/${encodeURIComponent(t)}`);
+  if (!res.ok) { document.getElementById('title').textContent = 'This link is not valid any more.'; map.setView([9.08, 8.68], 6); return; }
+  const d = await res.json();
+  const b = d.boundary;
+  document.getElementById('title').textContent = `${b.name} · ${Number(b.area_ha).toLocaleString()} ha`;
+  const outline = L.geoJSON(b.geojson, { style: { color: '#ffffff', weight: 2, fill: false } }).addTo(map);
+  map.fitBounds(outline.getBounds().pad(0.15));
+  if (d.overlay_png_base64) {
+    L.imageOverlay(`data:image/png;base64,${d.overlay_png_base64}`, d.overlay_bounds, { opacity: 0.85 }).addTo(map);
+    outline.bringToFront();
+    const s = d.stats || {};
+    const f = v => v == null ? '–' : Number(v).toFixed(3);
+    document.getElementById('panel').innerHTML = `<div><small>Result</small><b>${esc(d.label)}</b></div>
+      <div><small>Image of</small><b>${esc(d.obs_date || '–')}</b></div><div><small>Mean</small><b>${f(s.mean)}</b></div>
+      <div><small>Min</small><b>${f(s.min)}</b></div><div><small>Max</small><b>${f(s.max)}</b></div>`;
+    document.getElementById('note').textContent = (d.source === 'demo' ? 'Sample (made-up) data, for demonstration. ' : 'From a Sentinel-2 satellite image (10 m). ')
+      + `Shared${d.shared_by ? ' by ' + d.shared_by : ''} on ${new Date(d.shared_at).toLocaleDateString('en-GB')}. Read-only.`;
+  } else {
+    document.getElementById('panel').innerHTML = '<div>The farm\'s boundary only: no satellite result was shared with it.</div>';
+  }
+})();
+</script>
+</body>
+</html>
