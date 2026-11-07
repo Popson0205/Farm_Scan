@@ -117,7 +117,7 @@ def phenology(points: list[tuple[str, float]], kind: str = "ndvi") -> dict:
     up, down = base + GREENUP_FRACTION * amp, base + END_FRACTION * amp
     out = {"ok": True, "kind": kind, "points": len(pts), "first_image": _iso(x_obs[0]), "last_image": _iso(x_obs[-1]),
            "base": round(base, 3), "peak_value": round(top, 3), "amplitude": round(amp, 3),
-           "peak": {"date": _iso(days[ipk]), "plus_minus_days": round(_gap_around(x_obs, days[ipk]))}}
+           "peak": {"date": _iso(days[ipk]), "plus_minus_days": (lambda u: None if u == float("inf") else round(u))(_gap_around(x_obs, days[ipk]))}}
 
     rising = np.where(curve[:ipk + 1] < up)[0]
     if len(rising):
@@ -172,7 +172,28 @@ def season_reading(ndvi: list[tuple[str, float]], radar: list[tuple[str, float]]
             out["note"] = "Radar is used: the optical images do not show when the crop greened up (clouds)."
         elif best is r:
             out["note"] = "Radar is used: too few cloud-free optical images."
-    if declared_planting and best and best.get("planting"):
+    # How far to trust it: a green-up seen in the images and pinned to within 10 days (optical) or 20 (radar) is a
+    # reading; without a green-up, or from a curve that barely clears the threshold, it is only a hint.
+    if best:
+        g = best.get("greenup")
+        pm = g["plus_minus_days"] if g and g.get("plus_minus_days") is not None else None
+        strong = best["amplitude"] >= 1.5 * MIN_AMPLITUDE.get(best["kind"], 0.15)
+        if pm is not None and strong and pm <= (10 if best["kind"] == "ndvi" else 20):
+            out["confidence"] = "high" if best["kind"] == "ndvi" else "medium"
+        elif pm is not None and strong:
+            out["confidence"] = "medium"
+        else:
+            out["confidence"] = "low"
+            out["confidence_note"] = ("The green-up was not seen in the images" if not g else "The season's rise is small or loosely dated") \
+                + ": treat these dates as a hint, not a reading. Build the season over a longer period that starts before planting."
+    # Green all year: trees, bush or a perennial crop, not an annual crop cycle
+    if o["ok"] is False and o.get("points", 0) >= MIN_POINTS or o["ok"]:
+        vals = [v for _, v in ndvi if v is not None and np.isfinite(v)]
+        if len(vals) >= MIN_POINTS and min(vals) >= 0.5:
+            out.update(based_on=None, greenup=None, planting=None, peak=None, end=None, confidence=None,
+                       perennial=True, note="Green in every clear image (NDVI never below 0.5): tree cover, bush or a "
+                                            "perennial crop such as cocoa, oil palm or cashew; no annual crop season to read.")
+    if declared_planting and out.get("based_on") and best and best.get("planting"):
         p = best["planting"]
         d = date.fromisoformat(declared_planting[:10])
         lo, hi = date.fromisoformat(p["from"]), date.fromisoformat(p["to"])

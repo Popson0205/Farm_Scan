@@ -155,3 +155,14 @@ def test_radar_wins_when_clouds_leave_a_gap_at_green_up():
     r = season.season_reading(optical, radar)
     assert r["optical"]["ok"] and r["optical"]["greenup"]["plus_minus_days"] > 30
     assert r["based_on"] == "rvi" and "gap" in r["note"] and r["greenup"]["plus_minus_days"] <= 12
+
+
+def test_confidence_and_perennial_cover():
+    good = season.season_reading(obs(), [])
+    assert good["confidence"] == "high"
+    late = season.season_reading(obs(start=date(2026, 7, 20)), [])          # green-up not seen
+    assert late["confidence"] == "low" and "not seen" in late["confidence_note"]
+    forest = [((T0 + timedelta(days=10 * i)).isoformat(), 0.72 + 0.08 * np.sin(i / 3)) for i in range(25)]
+    radar = [(d, 0.35 + 0.15 * np.sin(i / 2)) for i, (d, _) in enumerate(forest)]
+    r = season.season_reading(forest, radar)
+    assert r["perennial"] and r["based_on"] is None and "perennial" in r["note"]

@@ -69,3 +69,18 @@ def as_user():
 @pytest.fixture
 def other_org():
     return str(uuid.uuid4())
+
+
+@pytest.fixture(autouse=True)
+def no_real_soilgrids(monkeypatch):
+    """Tests never reach the real SoilGrids (its answer would be cached and read by later tests at the same place);
+    tests that need it fake requests.get themselves."""
+    import requests
+    import soilgrids
+    real = requests.get
+
+    def get(url, *a, **k):
+        if str(url).startswith(soilgrids.URL):
+            raise requests.ConnectionError("no network in tests")
+        return real(url, *a, **k)
+    monkeypatch.setattr(requests, "get", get)
