@@ -14,15 +14,17 @@
  *   data-version   shown at the bottom
  *   data-accent    the product's colour (default GeoEstate green #3aa335)
  *   data-logo      default /logo.png
- *   data-wait      "app": stay until the application calls GeoEstateSplash.done() (at most 15 s);
+ *   data-min       how long the full launch lasts, in seconds (default 10, 1 to 20)
+ *   data-wait      "app": stay until the application calls GeoEstateSplash.done() (at most 15 s more);
  *                  otherwise (default): leave when the page has loaded
  *
  * From the application:
- *   GeoEstateSplash.step("Checking your GeoEstate ID", 60)   what it is doing, and how far along (0–100)
+ *   GeoEstateSplash.step("Checking your GeoEstate ID")       what it is doing (the bar follows the launch's time)
  *   GeoEstateSplash.done()                                     ready: the screen finishes its bar and fades away
  *
- * The full launch plays once per browser session ("cold start"); a reload in the same session shows a short one ("warm
- * start"). Reduced-motion settings are respected.
+ * The full launch (data-min seconds, 10 by default) plays once per browser session ("cold start"): the bar fills over that
+ * time while the steps of starting go by, and once the application is ready, "Skip" (or Esc, or a click outside the window)
+ * ends it early. A reload in the same session shows a short one ("warm start"). Reduced-motion settings are respected.
  */
 (function () {
   "use strict";
@@ -35,7 +37,10 @@
   var warm = false;
   try { warm = sessionStorage.getItem(key) === "1"; sessionStorage.setItem(key, "1"); } catch (e) { /* private window */ }
   var still = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  var minMs = still ? 300 : warm ? 450 : 2100;
+  // how long the full launch lasts (data-min, in seconds; 10 by default), like desktop software starting; a reload in the same
+  // session is quick, and reduced motion quicker still
+  var coldMs = Math.max(1, Math.min(20, parseFloat(ds.min) || 10)) * 1000;
+  var minMs = still ? 300 : warm ? 450 : coldMs;
   var t0 = Date.now();
   var esc = function (s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); };
 
@@ -89,9 +94,11 @@
     ".ges-foot{padding:14px 26px 18px;border-top:1px solid rgba(160,190,240,.10);background:rgba(4,10,24,.25);}",
     ".ges-status{display:flex;justify-content:space-between;gap:12px;font-size:12.5px;color:#c9d6ee;margin-bottom:8px;min-height:18px;}",
     ".ges-status span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}",
-    ".ges-status span:last-child{color:#7f93b7;font-variant-numeric:tabular-nums;}",
+    ".ges-status .ges-pct{color:#7f93b7;font-variant-numeric:tabular-nums;}",
     ".ges-bar{height:3px;border-radius:3px;background:rgba(255,255,255,.08);overflow:hidden;}",
     ".ges-bar i{display:block;height:100%;width:0;border-radius:3px;background:linear-gradient(90deg,var(--ges-a),#7fd36e);box-shadow:0 0 12px var(--ges-a);transition:width .45s ease;}",
+    ".ges-skip{margin-left:8px;padding:0;border:0;background:none;font:inherit;color:#8fb6ff;cursor:pointer;opacity:0;transition:opacity .4s;}",
+    ".ges-skip.is-on{opacity:1;}.ges-skip:hover{text-decoration:underline;}",
     ".ges-legal{display:flex;justify-content:space-between;gap:12px;margin-top:12px;font-size:11px;color:#6f84a8;}",
     "@media (max-width:560px){.ges-body{grid-template-columns:1fr;justify-items:center;text-align:center;padding:24px 20px 8px;}",
     ".ges-art{width:150px;height:150px;}.ges-brand{justify-content:center;}.ges h1.ges-name{font-size:36px;}.ges-legal{flex-direction:column;gap:2px;align-items:center;}}",
@@ -143,7 +150,7 @@
     '<h1 class="ges-name">' + name + '</h1>' +
     (ds.tagline ? '<p class="ges-tag">' + esc(ds.tagline) + "</p>" : "") +
     '<span class="ges-ed">' + esc(ds.edition || "") + "</span></div></div>" +
-    '<div class="ges-foot"><div class="ges-status"><span class="ges-msg">Starting ' + esc(product) + '…</span><span class="ges-pct">0 %</span></div>' +
+    '<div class="ges-foot"><div class="ges-status"><span class="ges-msg">Starting ' + esc(product) + '…</span><span><button type="button" class="ges-skip" tabindex="-1">Skip</button> <span class="ges-pct">0 %</span></span></div>' +
     '<div class="ges-bar"><i></i></div>' +
     '<div class="ges-legal"><span>' + (ds.version ? "Version " + esc(ds.version) + " · " : "") + "Part of the GeoEstate suite</span>" +
     "<span>© " + new Date().getFullYear() + " GeoEstate NIG Limited. All rights reserved.</span></div></div></div>";
@@ -155,38 +162,62 @@
   if (!document.body) document.addEventListener("DOMContentLoaded", function () { document.body.appendChild(root); });
 
   var bar = root.querySelector(".ges-bar i"), msg = root.querySelector(".ges-msg"), pctEl = root.querySelector(".ges-pct");
-  var pct = 0, told = false, finished = false;
+  var skip = root.querySelector(".ges-skip");
+  var pct = 0, ready = false, closing = false, toldAt = 0;
   function show(p) { pct = Math.max(pct, Math.min(100, p)); bar.style.width = pct + "%"; pctEl.textContent = Math.round(pct) + " %"; }
-  // until the application says what it is doing, the usual steps of starting
-  var steps = ["Starting " + product, "Loading the interface", "Connecting to GeoEstate ID", "Preparing your workspace"];
-  var k = 0;
+  // the usual steps of starting, shown in turn through the launch, between what the application says it is doing
+  var before = ["Starting " + product, "Loading the interface", "Connecting to GeoEstate ID", "Checking your licence"];
+  var after = ["Loading your organization's settings", "Loading map and analysis components", "Preparing your workspace", "Almost ready"];
+  var shown = -1, readyAt = 0;
   var tick = setInterval(function () {
-    if (finished) return;
-    show(pct + (92 - pct) * 0.07);                        // eases towards 92 % until the application is ready
-    if (!told && ++k % 6 === 0) msg.textContent = steps[Math.min(steps.length - 1, k / 6)] + "…";
-  }, 120);
-  show(8);
+    if (closing) return;
+    var f = Math.min(1, (Date.now() - t0) / minMs);          // how far through the launch, by time
+    var eased = 1 - Math.pow(1 - f, 1.6);                   // a little quicker at first, as starting software is
+    show(ready ? 3 + 97 * eased : Math.min(94, 3 + 91 * eased));
+    if (Date.now() - toldAt > 1600) {
+      // before the application is ready: its first steps; after: the rest, spread over the time left; never an earlier step
+      var list = ready ? after : before;
+      var from = ready ? readyAt : t0, span = Math.max(1, (ready ? t0 + minMs : t0 + minMs * 0.6) - from);
+      var i = Math.min(list.length - 1, Math.floor((Date.now() - from) / span * list.length)) + (ready ? before.length : 0);
+      if (i > shown) { shown = i; msg.textContent = (i < before.length ? before[i] : after[i - before.length]) + "…"; }
+    }
+    if (ready && f >= 1) close();
+  }, 100);
+  show(3);
 
-  function done() {
-    if (finished) return;
-    finished = true;
+  function close() {
+    if (closing) return;
+    closing = true;
     clearInterval(tick);
     msg.textContent = "Ready";
     show(100);
-    var wait = Math.max(0, minMs - (Date.now() - t0)) + (still ? 0 : 280);
     setTimeout(function () {
       root.classList.add("is-out");
       root.setAttribute("aria-busy", "false");
+      document.removeEventListener("keydown", onKey);
       setTimeout(function () { if (root.parentNode) root.parentNode.removeChild(root); }, 420);
-    }, wait);
+    }, still ? 0 : 350);
+  }
+  function onKey(e) { if (ready && (e.key === "Escape" || e.key === "Enter" || e.key === " ")) close(); }
+  function done() {
+    if (ready) return;
+    ready = true;
+    readyAt = Date.now();
+    shown = Math.max(shown, before.length - 1);
+    if (Date.now() - t0 >= minMs) { close(); return; }
+    skip.classList.add("is-on");                            // the application is ready: the rest of the launch can be skipped
+    skip.tabIndex = 0;
+    skip.addEventListener("click", close);
+    root.addEventListener("click", function (e) { if (!(e.target.closest && e.target.closest(".ges-win"))) close(); });   // outside the window
+    document.addEventListener("keydown", onKey);
   }
   window.GeoEstateSplash = {
-    step: function (text, p) { if (finished) return; told = true; if (text) msg.textContent = text + "…"; if (p != null) show(p); },
+    step: function (text) { if (closing) return; toldAt = Date.now(); if (text) msg.textContent = text + "…"; },
     edition: function (text) { var e = root.querySelector(".ges-ed"); if (e) e.textContent = text || ""; },
     done: done,
   };
   if (ds.wait === "app") {
-    setTimeout(done, 15000);                              // never in the way if the application forgets to say it is ready
+    setTimeout(done, minMs + 15000);                      // never in the way if the application forgets to say it is ready
   } else if (document.readyState === "complete") {
     done();
   } else {
