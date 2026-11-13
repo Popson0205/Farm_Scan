@@ -240,6 +240,22 @@ def list_boundaries(user=Depends(reader)):
                             "WHERE org_id = %s ORDER BY created_at DESC", (user["org_id"],)).fetchall()
 
 
+@app.get("/api/boundaries.geojson")
+def boundaries_geojson(user=Depends(reader)):
+    """The organization's farms for a map, with each farm's latest crop health (NDVI): what PolyGIS shows as a layer."""
+    with db.tx() as conn:
+        rows = conn.execute(
+            "SELECT b.id::text AS id, b.name, b.area_ha, b.source, b.created_at, b.details->>'farmer_name' AS farmer, "
+            "b.details->>'crop' AS crop, ST_AsGeoJSON(b.geom, 7) AS g, o.mean AS ndvi, o.obs_date AS ndvi_date FROM boundaries b "
+            "LEFT JOIN LATERAL (SELECT mean, obs_date FROM observations WHERE boundary_id = b.id AND index_name = 'NDVI' AND mean IS NOT NULL "
+            "  ORDER BY obs_date DESC LIMIT 1) o ON true WHERE b.org_id = %s ORDER BY b.name", (user["org_id"],)).fetchall()
+    return {"type": "FeatureCollection", "features": [
+        {"type": "Feature", "id": r["id"], "geometry": json.loads(r["g"]),
+         "properties": {"id": r["id"], "name": r["name"], "area_ha": round(r["area_ha"], 3), "farmer": r["farmer"], "crop": r["crop"],
+                        "ndvi": round(r["ndvi"], 3) if r["ndvi"] is not None else None, "ndvi_date": r["ndvi_date"], "source": r["source"],
+                        "added": r["created_at"].date().isoformat()}} for r in rows]}
+
+
 @app.delete("/api/boundary/{boundary_id}", status_code=204)
 def delete_boundary(boundary_id: str, user=Depends(need("manager", write=True))):
     """Remove a farm with its plots, timeline, notes and share links (frees its hectares)."""
