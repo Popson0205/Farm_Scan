@@ -1,5 +1,6 @@
 """FarmScan on the GeoEstate platform: organizations, roles, the plan's features and hectares, files, sign-in."""
 import json
+import uuid
 
 import pytest
 from fastapi.testclient import TestClient
@@ -170,3 +171,39 @@ def test_setup_check_says_what_is_missing():
     assert set(s["checks"]) >= {"sign_in", "email", "fires", "land_registry", "soil"}
     assert s["checks"]["sign_in"]["ok"] is False and "ID_SECRET" in s["checks"]["sign_in"]["what"]
     assert "secret" not in str(s).lower().replace("id_secret", "")
+
+
+def test_another_app_reads_the_farms_with_an_exchanged_token(monkeypatch):
+    """PolyGIS shows the farms as a layer: a FarmScan access token (from Geohub's token exchange) as a Bearer token reads
+    them for the person, with each farm's latest NDVI; changes are refused."""
+    org = "33333333-3333-4333-8333-333333333333"
+    claims = {"sub": "u7", "name": "Ada", "email": "a@example.com", "org": {"id": org, "name": "Coop", "role": "member"}, "act": {"sub": "gis"},
+              "product": {"plan": "standard", "status": "active", "features": ["monitoring"], "limits": {"hectares": 500}}}
+
+    class FakeID:
+        def verify(self, token):
+            if token != "exchanged":
+                raise identity.GeoEstateIDError("bad")
+            return claims
+
+    import db
+    with db.tx() as conn:
+        bid = str(uuid.uuid4())
+        sq = {"type": "Polygon", "coordinates": [[[7.2, 8.8], [7.201, 8.8], [7.201, 8.801], [7.2, 8.801], [7.2, 8.8]]]}
+        conn.execute("INSERT INTO boundaries (id, org_id, name, geojson, area_ha) VALUES (%s, %s, 'North block', %s, 1.2)", (bid, org, json.dumps(sq)))
+        conn.execute("INSERT INTO observations (boundary_id, index_name, obs_date, source, mean) VALUES (%s, 'NDVI', '2026-10-01', 'sentinel-2', 0.61), "
+                     "(%s, 'NDVI', '2026-10-21', 'sentinel-2', 0.664)", (bid, bid))
+    monkeypatch.setattr(identity, "gid", FakeID())
+    main.app.dependency_overrides.pop(identity.current_user)
+    try:
+        c = TestClient(main.app)
+        r = c.get("/api/boundaries.geojson", headers={"Authorization": "Bearer exchanged"})
+        assert r.status_code == 200, r.text
+        f = next(x for x in r.json()["features"] if x["id"] == bid)
+        assert f["properties"]["name"] == "North block" and f["properties"]["ndvi"] == 0.664 and f["properties"]["ndvi_date"] == "2026-10-21"
+        assert f["geometry"]["type"] == "Polygon"
+        assert c.get("/api/boundaries.geojson", headers={"Authorization": "Bearer junk"}).status_code == 401
+        assert c.delete(f"/api/boundary/{bid}", headers={"Authorization": "Bearer exchanged"}).status_code == 403
+    finally:
+        from conftest import _current
+        main.app.dependency_overrides[identity.current_user] = _current
