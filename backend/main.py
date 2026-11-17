@@ -316,6 +316,7 @@ def search_imagery(boundary_id: str, start_date: str, end_date: str, max_cloud_c
 
 _SCENE_CACHE: dict[str, dict] = {}  # scene_id -> band href map, populated by search_imagery
 _SCENE_META: dict[str, dict] = {}   # scene_id -> {date, cloud_cover, offset}
+MAX_FILL_SCENES = 6                 # at most this many other scenes are read to fill a scene's cloud gaps
 
 
 # ---------------------------------------------------------------------------
@@ -337,15 +338,21 @@ def process_imagery(boundary_id: str = Form(...), scene_id: str = Form(...), ind
     import stac_client
     bands_needed = INDEX_REGISTRY[index]["bands"]
     meta = _SCENE_META.get(scene_id, {})
-    # SCL cloud/shadow masking + common grid + reflectance offset are handled in stac_client
-    band_arrays, out_meta = stac_client.fetch_and_clip_bands(
-        href_map, boundary_geojson, bands_needed, reflectance_offset=meta.get("offset", 0.0))
+    # The other scenes from the same search, clearest first, used to fill this scene's cloud gaps so the field is full.
+    fallbacks = [(_SCENE_CACHE[sid], _SCENE_META.get(sid, {}).get("offset", 0.0))
+                 for sid in sorted((s for s in _SCENE_CACHE if s != scene_id),
+                                   key=lambda s: (101.0 if _SCENE_META.get(s, {}).get("cloud_cover") is None else _SCENE_META[s]["cloud_cover"]))
+                 if _SCENE_CACHE.get(sid)][:MAX_FILL_SCENES]
+    # SCL cloud/shadow masking + common grid + reflectance offset are handled in stac_client; holes then filled from fallbacks
+    band_arrays, out_meta = stac_client.fetch_and_clip_bands_filled(
+        href_map, fallbacks, boundary_geojson, bands_needed, reflectance_offset=meta.get("offset", 0.0))
 
     return _finish_processing(index, band_arrays, out_meta, boundary_geojson, boundary_id=boundary_id,
                               obs_date=meta.get("date") or date_cls.today().isoformat(),
                               source="live", scene_id=scene_id,
                               cloud_cover=meta.get("cloud_cover"),
-                              valid_fraction=out_meta.get("valid_fraction"))
+                              valid_fraction=out_meta.get("valid_fraction"),
+                              filled_scenes=out_meta.get("filled_scenes", 0))
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +442,7 @@ def _finish_processing(index: str, band_arrays: dict, out_meta: dict,
                         boundary_geojson: dict, field_mask: np.ndarray = None, demo: bool = False,
                         boundary_id: str = None, obs_date: str = None, source: str = "live",
                         scene_id: str = None, cloud_cover: float = None,
-                        valid_fraction: float = None):
+                        valid_fraction: float = None, filled_scenes: int = 0):
     idx_array = compute_index(index, band_arrays)
 
     if field_mask is None:
@@ -489,6 +496,7 @@ def _finish_processing(index: str, band_arrays: dict, out_meta: dict,
         "colormap": spec["colormap"],
         "stats": stats,
         "valid_fraction": valid_fraction,
+        "filled_scenes": filled_scenes,
         "observation": observation,
         "warning": warning,
     })
