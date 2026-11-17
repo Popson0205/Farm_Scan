@@ -145,11 +145,14 @@
   #stats-box .row { display: flex; justify-content: space-between; padding: 3px 0; }
   #stats-box .row b { color: var(--green-700); }
 
-  #legend {
-    height: 14px; border-radius: 4px; margin: 8px 0 4px;
-    background: linear-gradient(to right, #d73027, #ffffbf, #1a9850);
+  /* Legend drawn on the map (a Leaflet control), not in the sidebar */
+  .map-legend {
+    background: rgba(255,255,255,.92); padding: 7px 9px; border-radius: 8px;
+    box-shadow: 0 1px 6px rgba(0,0,0,.25); font-size: 11px; color: #333; line-height: 1.3; min-width: 132px;
   }
-  #legend-labels { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--muted); }
+  .map-legend .ml-title { font-weight: 600; margin-bottom: 4px; color: var(--green-700, #1a6b2e); }
+  .map-legend .ml-bar { height: 12px; border-radius: 3px; margin: 2px 0 3px; }
+  .map-legend .ml-labels { display: flex; justify-content: space-between; font-size: 10px; color: #666; }
 
   .status-msg { font-size: 12px; padding: 8px 10px; border-radius: 7px; margin-top: 8px; display: none; }
   .status-msg.show { display: block; }
@@ -304,6 +307,7 @@
     <div class="section" data-feature="monitoring">
       <h2>3 · Read the farm</h2>
       <button class="btn btn-primary" id="btn-process-live" disabled>▶ Run on the selected scene</button>
+      <button class="btn btn-secondary" id="btn-process-all" style="margin-top:8px;" disabled>▦ Run all indices at once</button>
       <div class="demo-only" style="display:none;">
         <button class="btn btn-secondary" id="btn-process-demo" style="margin-top:8px;">🧪 Practice with sample data</button>
         <div class="sample-note">Sample data is made up, not your farm: for demonstrations only.</div>
@@ -313,8 +317,7 @@
 
     <div class="section" id="results-section" style="display:none;">
       <h2>Results</h2>
-      <div id="legend"></div>
-      <div id="legend-labels"><span id="legend-min"></span><span id="legend-max"></span></div>
+      <p class="hint" id="results-hint" style="font-size:11.5px;color:var(--muted);margin:0 0 8px;">Tip: after “Run all indices”, click NDVI / NDRE / NDWI… above to flip between them on the map.</p>
       <div style="margin:10px 0 4px;">
         <label for="overlay-opacity" style="display:flex; justify-content:space-between;">
           <span>Overlay opacity</span><b id="opacity-val" style="color:var(--green-700);">90%</b>
@@ -530,6 +533,8 @@ function buildIndexButtons() {
       selectedIndex = key;
       document.querySelectorAll('.index-btn').forEach(el => el.classList.remove('active'));
       b.classList.add('active');
+      const cached = currentBoundaryId && indexResults[`${currentBoundaryId}:${key}`];
+      if (cached) renderOverlay(cached);   // already run (e.g. by "Run all"): flip to it at once
     };
     grid.appendChild(b);
   });
@@ -642,8 +647,11 @@ async function openFarm(id) {
     if (known) known.geojson = f.geojson;
     if (currentBoundaryId !== id) {                    // scenes and results belong to the farm they were found for
       selectedLiveScene = null;
+      Object.keys(indexResults).forEach(k => delete indexResults[k]);   // results belong to the old farm
+      hideLegend();
       document.getElementById('scene-list').innerHTML = '';
       document.getElementById('btn-process-live').disabled = true;
+      document.getElementById('btn-process-all').disabled = true;
       document.getElementById('results-section').style.display = 'none';
       document.getElementById('problem-box').style.display = 'none';
       document.getElementById('season-box').style.display = 'none';
@@ -712,6 +720,7 @@ function renderSceneList(scenes) {
       document.querySelectorAll('#scene-list .farm-item').forEach(x => x.classList.remove('active'));
       div.classList.add('active');
       document.getElementById('btn-process-live').disabled = false;
+      document.getElementById('btn-process-all').disabled = false;
     };
     el.appendChild(div);
   });
@@ -720,33 +729,86 @@ function renderSceneList(scenes) {
 // ---------------- Processing ----------------
 document.getElementById('btn-process-demo').onclick = () => runProcessing(false);
 document.getElementById('btn-process-live').onclick = () => runProcessing(true);
+document.getElementById('btn-process-all').onclick = () => runAllIndices();
+
+// Each index's result, kept so you can flip between indices without recomputing. Keyed by "boundaryId:index".
+const indexResults = {};
+
+async function processIndex(live, index) {
+  const form = new FormData();
+  form.append('boundary_id', currentBoundaryId);
+  form.append('index', index);
+  const endpoint = live ? '/imagery/process' : '/imagery/process-demo';
+  if (live) form.append('scene_id', selectedLiveScene);
+  const res = await fetch(`${API_BASE}${endpoint}`, { method: 'POST', body: form });
+  if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+  const data = await res.json();
+  indexResults[`${currentBoundaryId}:${index}`] = data;
+  lastProcessedIndex = index;
+  lastProcessedBoundaryId = currentBoundaryId;
+  return data;
+}
 
 async function runProcessing(live) {
   if (!currentBoundaryId) { showStatus('process-status', 'Import or draw a farm boundary first.', 'error'); return; }
   if (live && !selectedLiveScene) { showStatus('process-status', 'Pick a scene from the search results first.', 'error'); return; }
-
-  showStatus('process-status', `<span class="spinner"></span> Processing ${selectedIndex.toUpperCase()}…`, 'info');
+  document.getElementById('process-status').className = 'status-msg show info';
   document.getElementById('process-status').innerHTML = `<span class="spinner"></span> Processing ${selectedIndex.toUpperCase()}…`;
-
-  const form = new FormData();
-  form.append('boundary_id', currentBoundaryId);
-  form.append('index', selectedIndex);
-  const endpoint = live ? '/imagery/process' : '/imagery/process-demo';
-  if (live) form.append('scene_id', selectedLiveScene);
-
   try {
-    const res = await fetch(`${API_BASE}${endpoint}`, { method: 'POST', body: form });
-    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
-    const data = await res.json();
+    const data = await processIndex(live, selectedIndex);
     renderOverlay(data);
-    lastProcessedIndex = selectedIndex;
-    lastProcessedBoundaryId = currentBoundaryId;
     const filled = data.filled_scenes ? ` Cloud gaps filled from ${data.filled_scenes} other scene${data.filled_scenes > 1 ? 's' : ''}.` : '';
     showStatus('process-status', `${data.label} rendered${data.demo_mode ? ' (demo data)' : ''}.${filled}`, 'success');
   } catch (err) {
     showStatus('process-status', `Error: ${err.message}`, 'error');
   }
 }
+
+// Run every index for the selected scene, one after another, then show the selected one. The rest are cached so the
+// index buttons flip between them instantly.
+async function runAllIndices() {
+  if (!currentBoundaryId) { showStatus('process-status', 'Import or draw a farm boundary first.', 'error'); return; }
+  if (!selectedLiveScene) { showStatus('process-status', 'Pick a scene from the search results first.', 'error'); return; }
+  const keys = Object.keys(INDEX_META);
+  const allBtn = document.getElementById('btn-process-all'), oneBtn = document.getElementById('btn-process-live');
+  allBtn.disabled = oneBtn.disabled = true;
+  let done = 0; const failed = [];
+  for (const key of keys) {
+    document.getElementById('process-status').className = 'status-msg show info';
+    document.getElementById('process-status').innerHTML = `<span class="spinner"></span> Running all indices… (${done}/${keys.length}) ${key.toUpperCase()}`;
+    try {
+      const data = await processIndex(true, key);
+      done++;
+      if (key === selectedIndex) renderOverlay(data);   // show the selected index as soon as it is ready
+    } catch (err) { failed.push(key.toUpperCase()); }
+  }
+  const sel = indexResults[`${currentBoundaryId}:${selectedIndex}`]
+           || indexResults[`${currentBoundaryId}:${keys.find(k => indexResults[`${currentBoundaryId}:${k}`])}`];
+  if (sel) renderOverlay(sel);
+  allBtn.disabled = oneBtn.disabled = false;
+  showStatus('process-status', `Ran ${done} of ${keys.length} indices.` +
+    (failed.length ? ` Could not run: ${failed.join(', ')}.` : ' Click an index above to flip between them.'),
+    failed.length ? 'info' : 'success');
+}
+
+// The legend, drawn on the map as a Leaflet control (bottom-right), matching each index's colour ramp.
+const COLORMAP_GRADIENT = {
+  RdYlGn: 'linear-gradient(to right, #d73027, #ffffbf, #1a9850)',
+  Blues:  'linear-gradient(to right, #f7fbff, #6baed6, #08306b)',
+  BrBG:   'linear-gradient(to right, #8c510a, #f5f5f5, #01665e)',
+};
+const legendControl = L.control({ position: 'bottomright' });
+legendControl.onAdd = function () { this._div = L.DomUtil.create('div', 'map-legend'); this._div.style.display = 'none'; return this._div; };
+legendControl.addTo(map);
+function updateLegend(data) {
+  const grad = COLORMAP_GRADIENT[data.colormap] || COLORMAP_GRADIENT.RdYlGn;
+  legendControl._div.style.display = 'block';
+  legendControl._div.innerHTML =
+    `<div class="ml-title">${data.label}</div>` +
+    `<div class="ml-bar" style="background:${grad}"></div>` +
+    `<div class="ml-labels"><span>${data.value_range[0].toFixed(2)}</span><span>${data.value_range[1].toFixed(2)}</span></div>`;
+}
+function hideLegend() { if (legendControl._div) legendControl._div.style.display = 'none'; }
 
 function renderOverlay(data) {
   if (overlayLayer) map.removeLayer(overlayLayer);
@@ -762,8 +824,7 @@ function renderOverlay(data) {
   document.getElementById('stat-std').textContent = s.std !== null ? s.std.toFixed(3) : '–';
   document.getElementById('stat-px').textContent = s.pixel_count;
 
-  document.getElementById('legend-min').textContent = data.value_range[0].toFixed(2);
-  document.getElementById('legend-max').textContent = data.value_range[1].toFixed(2);
+  updateLegend(data);   // legend on the map, matching this index
 }
 
 // ---------------- Overlay opacity (drag the slider, or use - / +) ----------------
