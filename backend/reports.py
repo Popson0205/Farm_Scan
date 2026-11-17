@@ -162,20 +162,33 @@ def build_pdf(c: dict) -> bytes:
     story += [Table([[tbl(rows, [38 * mm, 82 * mm]), Outline(c["geometry"])]], colWidths=[122 * mm, 58 * mm],
                     style=TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))]
 
-    # 2. crop health now
+    # 2. crop health now — every index that was run, each with its map and numbers
     h = c.get("health")
+    indices = c.get("indices") or []
+    f3 = lambda v: "—" if v is None else f"{v:.3f}"  # noqa: E731
     story.append(Paragraph("Crop health now", h2))
-    if h and h.get("png_base64"):
-        st = h.get("stats") or {}
-        img = ImageReader(io.BytesIO(base64.b64decode(h["png_base64"])))
+
+    def index_block(ix):
+        st = ix.get("stats") or {}
+        img = ImageReader(io.BytesIO(base64.b64decode(ix["png_base64"])))
         iw, ih = img.getSize()
         w = 70 * mm
-        pic = RLImage(io.BytesIO(base64.b64decode(h["png_base64"])), width=w, height=w * ih / iw)
-        f3 = lambda v: "—" if v is None else f"{v:.3f}"  # noqa: E731
-        nums = tbl([("Index", h["label"]), ("Image of", h.get("obs_date") or "—"), ("Mean", f3(st.get("mean"))),
+        pic = RLImage(io.BytesIO(base64.b64decode(ix["png_base64"])), width=w, height=w * ih / iw)
+        nums = tbl([("Index", ix["label"]), ("Image of", ix.get("obs_date") or "—"), ("Mean", f3(st.get("mean"))),
                     ("Lowest / highest", f"{f3(st.get('min'))} / {f3(st.get('max'))}"), ("Spread (std)", f3(st.get("std"))),
                     ("Pixels (10 m)", f"{st.get('pixel_count', 0):,}")], [30 * mm, 60 * mm])
-        story.append(Table([[pic, nums]], colWidths=[76 * mm, 100 * mm], hAlign="LEFT", style=TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")])))
+        return KeepTogether(Table([[pic, nums]], colWidths=[76 * mm, 100 * mm], hAlign="LEFT",
+                                  style=TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")])))
+
+    if indices:
+        for i, ix in enumerate(indices):
+            story.append(index_block(ix))
+            story.append(Spacer(1, 6))
+        story.append(Paragraph(f"{len(indices)} index{'es' if len(indices) != 1 else ''} run on this farm. "
+                               "Sentinel-2, 10 m, cloud-masked per pixel. For a vegetation index, greener is denser, healthier "
+                               "canopy; yellow and red patches are weaker growth or bare ground.", small))
+    elif h and h.get("png_base64"):
+        story.append(index_block({**h, "stats": h.get("stats") or {}}))
         story.append(Paragraph("Sentinel-2, 10 m, cloud-masked per pixel. Greener is denser, healthier canopy; yellow and red "
                                "patches are weaker growth or bare ground.", small))
     elif h and h.get("timeline"):
@@ -187,6 +200,29 @@ def build_pdf(c: dict) -> bytes:
         story.append(grid([["Clear image", "NDVI (mean)", "Weakest tenth"]] +
                           [[t["date"], f"{t['mean']:.3f}", "—" if t["p10"] is None else f"{t['p10']:.3f}"] for t in h["timeline"]],
                           [30 * mm, 30 * mm, 30 * mm]))
+
+    # 2b. problem areas — the weak patches found in the NDVI map
+    pr = c.get("problems")
+    if pr is not None:
+        story.append(Paragraph("Problem areas", h2))
+        areas = pr.get("areas") or []
+        if areas:
+            s = pr.get("summary") or {}
+            story.append(Paragraph(f"{s.get('area_count', len(areas))} patch{'es' if (s.get('area_count', len(areas)) != 1) else ''} "
+                                   f"sit clearly below the field norm (NDVI median {f3(s.get('field_median'))}), covering "
+                                   f"{s.get('flagged_area_ha', 0)} ha ({s.get('flagged_pct_of_field', 0)}% of the field). "
+                                   "Confirm the cause on the ground before spending on inputs.", body))
+            rows = [["#", "Priority", "Area (ha)", "% field", "Mean NDVI", "Below norm", "Where (lat, lng)"]]
+            for a in areas:
+                cen = a.get("centroid") or {}
+                rows.append([a.get("rank"), (a.get("priority") or "").title(), f"{a.get('area_ha', 0):.3f}",
+                             f"{a.get('pct_of_field', 0)}%", f3(a.get("mean_value")), f"{a.get('severity_sigma', 0)}σ",
+                             f"{cen.get('lat', 0):.5f}, {cen.get('lng', 0):.5f}"])
+            story.append(grid(rows, [8 * mm, 18 * mm, 18 * mm, 14 * mm, 18 * mm, 16 * mm, 40 * mm]))
+            story.append(Paragraph("Patches more than 1.5 robust standard deviations below the field's NDVI median, ranked by "
+                                   "impact (area × how far below). Send them to a scout to confirm on the ground.", small))
+        else:
+            story.append(Paragraph("No problem areas: no patch sits clearly below the rest of the field in the latest NDVI map.", body))
 
     # 3. seasons
     story.append(Paragraph("Crop seasons seen from the satellites", h2))
