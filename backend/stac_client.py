@@ -276,3 +276,65 @@ def fetch_and_clip_bands(scene_href_map: dict, boundary_geojson: dict,
         "cloud_masked": bool(apply_cloud_mask and scene_href_map.get("scl")),
     }
     return band_arrays, out_meta
+
+
+def _scene_on_grid(href_map: dict, bands_needed: list[str], crs, transform, width: int, height: int,
+                   reflectance_offset: float = 0.0, apply_cloud_mask: bool = True) -> dict | None:
+    """Read one scene's bands onto a grid that is already fixed (another scene's), cloud-masked to NaN. Used to fill
+    the holes of a primary scene, so it reuses that scene's grid instead of clipping its own. None if a band is missing."""
+    raw = {}
+    for role in bands_needed:
+        if href_map.get(role) is None:
+            return None
+        raw[role] = _read_on_grid(href_map[role], crs, transform, width, height, Resampling.bilinear)
+    valid = np.ones((height, width), dtype=bool)
+    if apply_cloud_mask and href_map.get("scl"):
+        scl = _read_on_grid(href_map["scl"], crs, transform, width, height, Resampling.nearest)
+        valid &= scl_valid_mask(scl)
+    out = {}
+    for role, dn in raw.items():
+        arr = dn.astype(np.float32) / 10000.0 + reflectance_offset
+        arr = np.clip(arr, 0.0, None)
+        arr[dn == 0] = np.nan
+        arr[~valid] = np.nan
+        out[role] = arr
+    return out
+
+
+def fetch_and_clip_bands_filled(primary_href_map: dict, fallbacks: list[tuple[dict, float]],
+                                boundary_geojson: dict, bands_needed: list[str],
+                                reflectance_offset: float = 0.0, apply_cloud_mask: bool = True) -> tuple[dict, dict]:
+    """The primary scene, cloud-masked, with the holes left by cloud *inside the field* filled from the next clearest
+    scenes (in `fallbacks` order), so the image covers the whole field. Masking is kept: a pixel is only filled from a
+    scene where that scene is itself cloud-free. `fallbacks`: [(href_map, reflectance_offset), ...].
+
+    out_meta adds `filled_scenes` (how many scenes contributed to the fill) on top of fetch_and_clip_bands's keys;
+    valid_pixels / valid_fraction are recomputed after filling.
+    """
+    bands, meta = fetch_and_clip_bands(primary_href_map, boundary_geojson, bands_needed,
+                                       reflectance_offset=reflectance_offset, apply_cloud_mask=apply_cloud_mask)
+    crs, transform, h, w = meta["crs"], meta["transform"], meta["height"], meta["width"]
+    geom = transform_geom("EPSG:4326", crs, boundary_geojson)
+    field = geometry_mask([geom], out_shape=(h, w), transform=transform, invert=True)
+    first = bands_needed[0]
+    filled = 0
+    for href_map, off in fallbacks:
+        holes = field & np.isnan(bands[first])
+        if not holes.any():
+            break
+        try:
+            fb = _scene_on_grid(href_map, bands_needed, crs, transform, w, h, off, apply_cloud_mask)
+        except Exception:                      # a bad fallback never breaks the primary image
+            continue
+        if fb is None:
+            continue
+        add = holes & ~np.isnan(fb[first])
+        if add.any():
+            for role in bands_needed:
+                bands[role][add] = fb[role][add]
+            filled += 1
+    valid_now = int((field & ~np.isnan(bands[first])).sum())
+    meta["valid_pixels"] = valid_now
+    meta["valid_fraction"] = (valid_now / meta["field_pixels"]) if meta["field_pixels"] else 0.0
+    meta["filled_scenes"] = filled
+    return bands, meta

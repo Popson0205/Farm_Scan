@@ -60,9 +60,9 @@ def test_search_process_every_index_and_export(sat, farm):
         assert abs(lat(rows.min()) - 9.075) < px and abs(lat(rows.max()) - 9.070) < px, (lat(rows.min()), lat(rows.max()))
         assert abs(lng(cols.min()) - 7.400) < px and abs(lng(cols.max()) - 7.405) < px, (lng(cols.min()), lng(cols.max()))
 
-    # the cloudy scene: the cloud is masked, the image kept but flagged
+    # the cloudy scene: the cloud is masked, then its holes are filled from the clear scene, so the field is full again
     d = client.post("/api/imagery/process", data={"boundary_id": farm, "scene_id": cloudy, "index": "ndvi"}).json()
-    assert d["valid_fraction"] < 0.9 and d["warning"] is None or "cloud-free" in (d["warning"] or "")
+    assert d["filled_scenes"] >= 1 and d["valid_fraction"] > 0.99, (d["filled_scenes"], d["valid_fraction"])
 
     # back to the clear one, then everything that reuses it
     client.post("/api/imagery/process", data={"boundary_id": farm, "scene_id": clear, "index": "ndvi"})

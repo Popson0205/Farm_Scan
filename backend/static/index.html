@@ -741,7 +741,8 @@ async function runProcessing(live) {
     renderOverlay(data);
     lastProcessedIndex = selectedIndex;
     lastProcessedBoundaryId = currentBoundaryId;
-    showStatus('process-status', `${data.label} rendered${data.demo_mode ? ' (demo data)' : ''}.`, 'success');
+    const filled = data.filled_scenes ? ` Cloud gaps filled from ${data.filled_scenes} other scene${data.filled_scenes > 1 ? 's' : ''}.` : '';
+    showStatus('process-status', `${data.label} rendered${data.demo_mode ? ' (demo data)' : ''}.${filled}`, 'success');
   } catch (err) {
     showStatus('process-status', `Error: ${err.message}`, 'error');
   }
