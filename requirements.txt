@@ -1,6 +1,6 @@
 # Deploy manifest for Railway: Railpack builds from the repo root and copies only
 # this file into the install layer, so the dependencies are listed here directly
-# (a "-r backend/requirements.txt" reference fails: that file is not in the layer).
+# rather than referencing the backend list (that file is not in the install layer).
 # Keep this in sync with backend/requirements.txt, which is the list for local dev.
 fastapi>=0.110
 uvicorn[standard]>=0.29
