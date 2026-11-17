@@ -1390,6 +1390,14 @@ def _alerts_loop(stop: threading.Event) -> None:
 # Farm verification reports
 # ---------------------------------------------------------------------------
 
+def _thumb_b64(png_bytes: bytes) -> str:
+    img = Image.open(io.BytesIO(png_bytes))
+    img.thumbnail((700, 700))
+    buf = io.BytesIO()
+    img.save(buf, "PNG", optimize=True)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
 def _health_now(farm_id: str, index: str) -> dict | None:
     """The latest result run for the farm (map image, numbers), if one is in memory, and the timeline's last images."""
     cached = _RESULT_CACHE.get(f"{farm_id}:{index}") or _RESULT_CACHE.get(f"{farm_id}:ndvi")
@@ -1400,13 +1408,32 @@ def _health_now(farm_id: str, index: str) -> dict | None:
     out = {"timeline": [{"date": o["obs_date"], "mean": round(o["mean"], 3), "p10": None if o["p10"] is None else round(o["p10"], 3)}
                         for o in hist]}
     if cached and cached.get("source") != "demo":
-        img = Image.open(io.BytesIO(cached["png_bytes"]))
-        img.thumbnail((700, 700))
-        buf = io.BytesIO()
-        img.save(buf, "PNG", optimize=True)
         out |= {"label": cached["label"], "obs_date": cached.get("obs_date"), "stats": cached["stats"],
-                "png_base64": base64.b64encode(buf.getvalue()).decode()}
+                "png_base64": _thumb_b64(cached["png_bytes"])}
     return out
+
+
+def _index_blocks(farm_id: str) -> list[dict]:
+    """Every index run for the farm that is still in memory (map image + numbers), so the report can show them all."""
+    out = []
+    for idx, spec in INDEX_REGISTRY.items():
+        cached = _RESULT_CACHE.get(f"{farm_id}:{idx}")
+        if cached and cached.get("source") != "demo":
+            out.append({"index": idx, "label": cached["label"], "obs_date": cached.get("obs_date"),
+                        "stats": cached["stats"], "png_base64": _thumb_b64(cached["png_bytes"])})
+    return out
+
+
+def _problem_areas_for_report(farm_id: str) -> dict | None:
+    """The weak patches found in the last NDVI run for the farm, for the report's Problem areas section."""
+    cached = _RESULT_CACHE.get(f"{farm_id}:ndvi")
+    if not cached or cached.get("source") == "demo" or cached.get("array") is None:
+        return None
+    try:
+        pa = monitoring_mod.find_problem_areas(cached["array"], cached["transform"], cached["crs"], "ndvi")
+    except (ValueError, KeyError):
+        return None
+    return {"summary": pa["summary"], "areas": pa["areas"][:8]}
 
 
 def _window_words(p: dict) -> str | None:
@@ -1475,7 +1502,8 @@ def issue_farm_report(boundary_id: str = Form(...), index: str = Form("ndvi"), u
                  "declared_ha": declared, "declared_vs_measured_pct": round(100 * (float(declared) - farm["area_ha"]) / farm["area_ha"])
                  if declared else None, "community": d.get("community"), "lga": d.get("lga"), "state": d.get("state"),
                  "farmer": d.get("farmer_name"), "crops": d.get("crops"), "mapped_by": d.get("collected_by") if farm.get("source") == "geohub" else None},
-        "geometry": farm["geojson"], "health": _health_now(farm["id"], index), "seasons": seasons,
+        "geometry": farm["geojson"], "health": _health_now(farm["id"], index),
+        "indices": _index_blocks(farm["id"]), "problems": _problem_areas_for_report(farm["id"]), "seasons": seasons,
         "images": {"optical": n_opt, "radar": n_rad}, "alerts": alerts_now, "rainfall": rain, "suitability": suit,
         "title": reports_mod.title_status(c.y, c.x) if "verification" in feats else "not_in_plan",
     }
