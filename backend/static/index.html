@@ -317,7 +317,7 @@
 
     <div class="section" id="results-section" style="display:none;">
       <h2>Results</h2>
-      <p class="hint" id="results-hint" style="font-size:11.5px;color:var(--muted);margin:0 0 8px;">Tip: after “Run all indices”, click NDVI / NDRE / NDWI… above to flip between them on the map.</p>
+      <p class="hint" id="results-hint" style="font-size:11.5px;color:var(--muted);margin:0 0 8px;">Tip: after “Run all indices”, use the layer control (top-right of the map) to toggle each index on or off, or click NDVI / NDRE / NDWI… above to bring one up.</p>
       <div style="margin:10px 0 4px;">
         <label for="overlay-opacity" style="display:flex; justify-content:space-between;">
           <span>Overlay opacity</span><b id="opacity-val" style="color:var(--green-700);">90%</b>
@@ -504,7 +504,8 @@ const drawControl = new L.Control.Draw({
   }
 });
 
-let overlayLayer = null;
+const indexLayers = {};     // index -> L.imageOverlay, each a toggle in the map's layer control
+let layerControl = null;    // L.control.layers, created when the first index is run
 let overlayOpacity = 0.9;   // user-adjustable via the Results slider
 let currentBoundaryId = null;
 let currentBoundaries = []; // {id, name, area_ha, geojson}
@@ -533,8 +534,7 @@ function buildIndexButtons() {
       selectedIndex = key;
       document.querySelectorAll('.index-btn').forEach(el => el.classList.remove('active'));
       b.classList.add('active');
-      const cached = currentBoundaryId && indexResults[`${currentBoundaryId}:${key}`];
-      if (cached) renderOverlay(cached);   // already run (e.g. by "Run all"): flip to it at once
+      if (currentBoundaryId && indexResults[`${currentBoundaryId}:${key}`]) showIndex(key);   // already run: show its layer
     };
     grid.appendChild(b);
   });
@@ -628,7 +628,7 @@ function renderFarmList() {
         if (!res.ok) { showStatus('boundary-status', (await res.json()).detail || 'Could not remove it.', 'error'); return; }
         currentBoundaries = currentBoundaries.filter(b => b.id !== f.id);
         ME.hectares_used = Math.max(0, Math.round((ME.hectares_used - f.area_ha) * 100) / 100); renderAccount();
-        if (currentBoundaryId === f.id) { currentBoundaryId = null; drawnItems.clearLayers(); if (overlayLayer) { map.removeLayer(overlayLayer); overlayLayer = null; } }
+        if (currentBoundaryId === f.id) { currentBoundaryId = null; drawnItems.clearLayers(); resetLayers(); }
         renderFarmList();
       };
       div.appendChild(x);
@@ -648,7 +648,7 @@ async function openFarm(id) {
     if (currentBoundaryId !== id) {                    // scenes and results belong to the farm they were found for
       selectedLiveScene = null;
       Object.keys(indexResults).forEach(k => delete indexResults[k]);   // results belong to the old farm
-      hideLegend();
+      resetLayers();
       document.getElementById('scene-list').innerHTML = '';
       document.getElementById('btn-process-live').disabled = true;
       document.getElementById('btn-process-all').disabled = true;
@@ -663,7 +663,7 @@ async function openFarm(id) {
     drawGeoJSONOnMap(f.geojson);
     map.fitBounds(L.geoJSON(f.geojson).getBounds());
     renderFarmList();
-    if (overlayLayer) { map.removeLayer(overlayLayer); overlayLayer = null; }
+    resetLayers();
     if (typeof loadAnnotations === 'function') loadAnnotations();
   } catch (err) {
     showStatus('boundary-status', `Error: ${err.message}`, 'error');
@@ -744,6 +744,7 @@ async function processIndex(live, index) {
   if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
   const data = await res.json();
   indexResults[`${currentBoundaryId}:${index}`] = data;
+  layerFor(data);   // register a toggle for this index (shown on demand)
   lastProcessedIndex = index;
   lastProcessedBoundaryId = currentBoundaryId;
   return data;
@@ -810,12 +811,23 @@ function updateLegend(data) {
 }
 function hideLegend() { if (legendControl._div) legendControl._div.style.display = 'none'; }
 
-function renderOverlay(data) {
-  if (overlayLayer) map.removeLayer(overlayLayer);
-  const bounds = data.overlay_bounds; // [[south, west],[north, east]]
-  overlayLayer = L.imageOverlay(`data:image/png;base64,${data.overlay_png_base64}`, bounds, { opacity: overlayOpacity })
-    .addTo(map);
+// Each run index is its own map layer, toggled on/off from the layer control (top-right). Running several keeps them
+// all as toggles; the stats box and legend follow whichever is shown.
+function layerFor(data) {
+  const url = `data:image/png;base64,${data.overlay_png_base64}`;
+  let layer = indexLayers[data.index];
+  if (layer) {
+    layer.setUrl(url); layer.setBounds(data.overlay_bounds); layer.setOpacity(overlayOpacity);
+  } else {
+    layer = L.imageOverlay(url, data.overlay_bounds, { opacity: overlayOpacity });
+    indexLayers[data.index] = layer;
+    if (!layerControl) layerControl = L.control.layers(null, {}, { collapsed: false, position: 'topright' }).addTo(map);
+    layerControl.addOverlay(layer, data.label);
+  }
+  return layer;
+}
 
+function updateStatsAndLegend(data) {
   document.getElementById('results-section').style.display = 'block';
   const s = data.stats;
   document.getElementById('stat-mean').textContent = s.mean !== null ? s.mean.toFixed(3) : '–';
@@ -823,9 +835,38 @@ function renderOverlay(data) {
   document.getElementById('stat-max').textContent = s.max !== null ? s.max.toFixed(3) : '–';
   document.getElementById('stat-std').textContent = s.std !== null ? s.std.toFixed(3) : '–';
   document.getElementById('stat-px').textContent = s.pixel_count;
-
-  updateLegend(data);   // legend on the map, matching this index
+  updateLegend(data);
 }
+
+// Show an index's layer on the map (used by the single run, "run all", and the index buttons).
+function showIndex(index) {
+  const data = indexResults[`${currentBoundaryId}:${index}`];
+  if (!data) return;
+  const layer = layerFor(data);
+  if (!map.hasLayer(layer)) layer.addTo(map);
+  updateStatsAndLegend(data);
+}
+
+function renderOverlay(data) { showIndex(data.index); }
+
+function resetLayers() {
+  Object.values(indexLayers).forEach((l) => { if (map.hasLayer(l)) map.removeLayer(l); });
+  for (const k in indexLayers) delete indexLayers[k];
+  if (layerControl) { map.removeControl(layerControl); layerControl = null; }
+  hideLegend();
+}
+
+// Toggling a layer in the control updates the stats box and legend to match what is visible.
+map.on('overlayadd', (e) => {
+  const idx = Object.keys(indexLayers).find((k) => indexLayers[k] === e.layer);
+  const data = idx && indexResults[`${currentBoundaryId}:${idx}`];
+  if (data) updateStatsAndLegend(data);
+});
+map.on('overlayremove', () => {
+  const visible = Object.keys(indexLayers).filter((k) => map.hasLayer(indexLayers[k]));
+  if (!visible.length) hideLegend();
+  else { const data = indexResults[`${currentBoundaryId}:${visible[visible.length - 1]}`]; if (data) updateStatsAndLegend(data); }
+});
 
 // ---------------- Overlay opacity (drag the slider, or use - / +) ----------------
 function setOverlayOpacity(pct) {
@@ -833,7 +874,7 @@ function setOverlayOpacity(pct) {
   overlayOpacity = pct / 100;
   document.getElementById('overlay-opacity').value = pct;
   document.getElementById('opacity-val').textContent = `${pct}%`;
-  if (overlayLayer) overlayLayer.setOpacity(overlayOpacity);   // live while dragging
+  Object.values(indexLayers).forEach((l) => l.setOpacity(overlayOpacity));   // live while dragging
 }
 document.getElementById('overlay-opacity').addEventListener('input', e => setOverlayOpacity(+e.target.value));
 document.getElementById('opacity-down').onclick = () => setOverlayOpacity(overlayOpacity * 100 - 5);
@@ -1365,7 +1406,7 @@ document.getElementById('btn-portfolio').onclick = async () => {
   const p = await res.json();
   if (!p.farms.length) { showStatus('boundary-status', 'No farms yet.', 'info'); return; }
   currentBoundaryId = null; drawnItems.clearLayers();
-  if (overlayLayer) { map.removeLayer(overlayLayer); overlayLayer = null; }
+  resetLayers();
   if (portfolioLayer) map.removeLayer(portfolioLayer);
   portfolioLayer = L.geoJSON(p.farms.map(f => ({ type: 'Feature', properties: f, geometry: f.geometry })), {
     style: ft => ({ color: '#ffffff', weight: 1.5, fillColor: NDVI_COLOR(ft.properties.latest && ft.properties.latest.mean), fillOpacity: 0.7 }),
