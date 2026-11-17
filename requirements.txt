@@ -1,1 +1,26 @@
--r backend/requirements.txt
+# Deploy manifest for Railway: Railpack builds from the repo root and copies only
+# this file into the install layer, so the dependencies are listed here directly
+# rather than referencing the backend list (that file is not in the install layer).
+# Keep this in sync with backend/requirements.txt, which is the list for local dev.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+rasterio>=1.3
+numpy>=1.26
+shapely>=2.0
+geopandas>=0.14
+pystac-client>=0.8
+planetary-computer>=1.0
+pillow>=10.0
+python-multipart>=0.0.9
+scikit-learn>=1.4
+scipy>=1.12
+fiona>=1.9
+reportlab>=4.1
+requests>=2.31
+# the GeoEstate platform: database, sign-in, bucket
+psycopg[binary,pool]>=3.2
+pydantic-settings>=2.4
+PyJWT[crypto]>=2.9
+httpx>=0.27
+boto3>=1.34
+pyproj>=3.6
