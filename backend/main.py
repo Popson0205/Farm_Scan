@@ -64,6 +64,8 @@ async def lifespan(_app):
     db.pool.close()
 
 
+APP_VERSION = "1.0.0"   # FarmScan software version, shown in the About panel
+
 app = FastAPI(title="FarmScan API", description="Satellite farm health mapping, on the GeoEstate platform",
               lifespan=lifespan)
 
@@ -176,7 +178,7 @@ def me(user=Depends(current_user)):
                             (user["org_id"],)).fetchone()
     return user | {"hectares_used": round(used["ha"], 2), "farms": used["farms"],
                    "hectares_limit": (user["limits"] or {}).get("hectares"), "geohub_url": settings.geohub_url,
-                   "demo_tools": settings.demo_tools}
+                   "demo_tools": settings.demo_tools, "version": APP_VERSION}
 
 
 @app.get("/api/apps", summary="The GeoEstate apps the organization has, for the app switcher")
